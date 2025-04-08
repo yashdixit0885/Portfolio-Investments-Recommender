@@ -1,4 +1,4 @@
-# Investment Analyzer
+# Portfolio Investments Recommender
 
 A comprehensive investment analysis system that combines fundamental, technical, and sentiment analysis to generate trade recommendations. The system analyzes market data, company fundamentals, news sentiment, and technical indicators to provide actionable trading insights.
 
