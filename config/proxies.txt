@@ -1,0 +1,26 @@
+ # Proxy Configuration File
+# Add your proxies in the format: ip:port
+# One proxy per line
+# Lines starting with # are comments
+
+# Example proxies (replace with your actual proxies):
+# 192.168.1.1:8080
+# 10.0.0.1:3128
+# proxy1.example.com:8080
+# proxy2.example.com:8080
+
+# You can get proxies from:
+# 1. Paid proxy services (recommended):
+#    - Bright Data (formerly Luminati)
+#    - Oxylabs
+#    - SmartProxy
+#    - ProxyScrape
+#    - IPRoyal
+#
+# 2. Free proxy lists (less reliable):
+#    - free-proxy-list.net
+#    - geonode.com/free-proxy-list
+#    - proxy-list.download
+#
+# Note: Free proxies are less reliable and may be blocked by many websites.
+# For production use, it's recommended to use paid proxy services.
