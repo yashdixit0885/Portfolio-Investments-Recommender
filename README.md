@@ -73,8 +73,8 @@ Trader/
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yashdixit0885/Trader.git
-   cd Trader
+   git clone https://github.com/yashdixit0885/Portfolio-Investments-Recommender.git
+   cd Portfolio-Investments-Recommender
    ```
 
 2. Create and activate a virtual environment:
