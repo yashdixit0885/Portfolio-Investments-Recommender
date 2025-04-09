@@ -9,3 +9,8 @@ beautifulsoup4>=4.9.3
 scikit-learn>=0.24.2
 matplotlib>=3.4.3
 seaborn>=0.11.2
+# Testing dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-mock>=3.10.0
+pytest-asyncio>=0.21.0

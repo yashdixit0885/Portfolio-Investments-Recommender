@@ -1,564 +1,291 @@
+"""
+Identifies securities with high potential for significant price movement.
+
+The core logic resides in the `_calculate_price_movement_potential` method. 
+It calculates a score based on several factors, weighted to prioritize indicators 
+of potential volatility and significant price changes, regardless of direction:
+
+1. Volatility/Beta (25%): Higher beta suggests higher potential for larger price swings.
+   Normalized based on a beta of 2.0 representing maximum contribution.
+
+2. Absolute Price Momentum (35%): The magnitude of the price's deviation from its 
+   50-day and 200-day moving averages. Larger deviations suggest the price is 
+   already moving significantly or is far from its recent trends.
+   Normalized based on a 20% deviation representing maximum contribution.
+
+3. Volume Surge (25%): Significant increases in volume compared to the 50-day 
+   and 200-day averages. High volume can confirm the strength behind a price move.
+   Normalized based on volume doubling (100% increase) representing maximum contribution.
+
+4. RSI Extremes (15%): How far the Relative Strength Index (RSI) is from the neutral 
+   midpoint of 50. Values closer to 0 or 100 indicate potentially overbought or 
+   oversold conditions, which can precede significant price reversals or continuations.
+   Normalized based on RSI reaching 20 or 80 representing maximum contribution.
+
+The overall score aggregates these factors to rank securities by their likelihood 
+of experiencing substantial price movement, making them candidates for further 
+detailed research.
+"""
+
 import os
+import json
 import pandas as pd
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
-from utils.common import save_to_json, load_from_json, get_current_time, save_recommendations_to_csv
+from src.utils.common import save_to_json, load_from_json, get_current_time, save_recommendations_to_csv
 import numpy as np
 
 class InvestmentAnalyzer:
-    """Analyzes securities data from spreadsheets to identify key companies for research."""
+    """Identifies securities with high price movement potential from source data for further research."""
     
     def __init__(self):
         """Initialize the InvestmentAnalyzer with configuration and logging."""
         self.logger = logging.getLogger('investment_analyzer')
         self.data_dir = 'data'
-        self.flagged_opportunities_file = os.path.join(self.data_dir, 'flagged_opportunities.json')
+        self.input_file = os.path.join(self.data_dir, 'securities_data.csv')
+        self.output_file = os.path.join(self.data_dir, 'high_potential_securities.json')
         
         # Create data directory if it doesn't exist
         os.makedirs(self.data_dir, exist_ok=True)
         
-        # Load configuration
+        # Load configuration (though less critical now, kept for potential future use)
         self.load_config()
         
     def load_config(self):
         """Load configuration from environment variables or use defaults."""
-        self.min_volume = int(os.getenv('MIN_VOLUME', '500000'))  # Lowered to 500K shares
-        self.min_market_cap = float(os.getenv('MIN_MARKET_CAP', '50000000'))  # Lowered to $50M
-        self.price_change_threshold = float(os.getenv('PRICE_CHANGE_THRESHOLD', '0.002'))  # Lowered to 0.2%
-        self.volume_change_threshold = float(os.getenv('VOLUME_CHANGE_THRESHOLD', '0.05'))  # Lowered to 5%
+        # These thresholds are less relevant for the new goal but kept for context
+        self.min_volume = int(os.getenv('MIN_VOLUME', '500000')) 
+        self.min_market_cap = float(os.getenv('MIN_MARKET_CAP', '50000000'))
         
-    def process_securities_data(self, file_path: str) -> List[Dict]:
-        """Process securities data from CSV or Excel file and identify investment opportunities."""
+    def _clean_numeric(self, x):
+        """Cleans and converts input to a float, handling N/A, percentages, and commas."""
+        if pd.isna(x) or x == 'N/A':
+            return np.nan # Use NaN for missing values initially
+        if isinstance(x, (int, float)):
+            return float(x)
+        # Remove any spaces and handle percentage signs
+        x = str(x).strip().replace(' ', '')
+        # Remove percentage sign and handle plus signs
+        x = x.replace('%', '').replace('+', '')
+        # Remove commas from numbers
+        x = x.replace(',', '')
         try:
-            # Read file based on extension
-            if file_path.endswith('.csv'):
-                df = pd.read_csv(file_path)
-            elif file_path.endswith(('.xlsx', '.xls')):
-                df = pd.read_excel(file_path)
-            else:
-                raise ValueError("Unsupported file format. Please use CSV or Excel.")
+            return float(x)
+        except ValueError:
+            self.logger.debug(f"Could not convert '{x}' to float, returning NaN")
+            return np.nan
 
-            # Log available columns for debugging
-            self.logger.info(f"Available columns: {df.columns.tolist()}")
+    def load_and_prepare_securities(self) -> pd.DataFrame:
+        """Loads securities data from the CSV file, cleans it, and calculates necessary metrics."""
+        try:
+            if not os.path.exists(self.input_file):
+                 self.logger.error(f"Input file not found: {self.input_file}")
+                 return pd.DataFrame()
 
-            # Function to clean and convert numeric strings
-            def clean_numeric(x):
-                if pd.isna(x) or x == 'N/A':
-                    return 0.0
-                if isinstance(x, (int, float)):
-                    return float(x)
-                # Remove any spaces and handle percentage signs
-                x = str(x).strip().replace(' ', '')
-                # Remove percentage sign and handle plus signs
-                x = x.replace('%', '').replace('+', '')
-                # Remove commas from numbers
-                x = x.replace(',', '')
-                try:
-                    return float(x)
-                except:
-                    return 0.0
+            df = pd.read_csv(self.input_file)
+            self.logger.info(f"Loaded {len(df)} securities from {self.input_file}")
+            self.logger.debug(f"Available columns: {df.columns.tolist()}")
 
-            # Convert percentage strings to floats
-            percentage_columns = ['% Insider', 'Div Yield(a)', 'Sales %(q)', 'Sales %(a)', 'Profit%', '5Y Rev%', '14D Rel Str']
-            for col in percentage_columns:
-                if col in df.columns:
-                    df[col] = df[col].apply(clean_numeric) / 100
-
-            # Convert numeric columns
+            # Define columns to clean and convert
+            percentage_columns = ['% Insider', 'Div Yield(a)', 'Sales %(q)', 'Sales %(a)', 'Profit%', '5Y Rev%', '14D Rel Str', '% Institutional']
             numeric_columns = ['Last', 'Volume', 'Market Cap', 'Price Vol', '200D Avg Vol', 
                              '50D Avg Vol', '14D MACD', '200D MA', '50D MA', 'P/C OI',
-                             'Mean Target', '% Institutional', 'Beta', 'Debt/Equity', 'Price/Book', 'P/E fwd']
-            
-            for col in numeric_columns:
+                             'Mean Target', 'Beta', 'Debt/Equity', 'Price/Book', 'P/E fwd']
+
+            # Clean percentage columns
+            for col in percentage_columns:
                 if col in df.columns:
-                    df[col] = df[col].apply(clean_numeric)
+                    df[col] = df[col].apply(self._clean_numeric) / 100.0 # Convert percentage right away
+                else:
+                    self.logger.warning(f"Percentage column '{col}' not found in input file.")
 
-            opportunities = []
-            for _, row in df.iterrows():
-                try:
-                    # Calculate volume change relative to averages (more lenient)
-                    volume_change_50d = ((row['Volume'] / row['50D Avg Vol']) - 1) * 100 if pd.notnull(row['50D Avg Vol']) and row['50D Avg Vol'] > 0 else 0
-                    volume_change_200d = ((row['Volume'] / row['200D Avg Vol']) - 1) * 100 if pd.notnull(row['200D Avg Vol']) and row['200D Avg Vol'] > 0 else 0
-
-                    # Calculate price momentum (more lenient)
-                    price_momentum_50d = ((row['Last'] / row['50D MA']) - 1) * 100 if pd.notnull(row['50D MA']) and row['50D MA'] > 0 else 0
-                    price_momentum_200d = ((row['Last'] / row['200D MA']) - 1) * 100 if pd.notnull(row['200D MA']) and row['200D MA'] > 0 else 0
-
-                    # Enhanced opportunity criteria (more lenient)
-                    if (row['Volume'] >= self.min_volume * 0.8 or  # 20% more lenient on volume
-                        row['Market Cap'] >= self.min_market_cap * 0.8 or  # 20% more lenient on market cap
-                        abs(price_momentum_50d) >= self.price_change_threshold * 0.8 or  # 20% more lenient on price change
-                        volume_change_50d >= self.volume_change_threshold * 0.8 or  # 20% more lenient on volume change
-                        volume_change_200d >= self.volume_change_threshold * 0.8):  # Consider 200-day volume change
-                        
-                        # Calculate opportunity score with new metrics
-                        opportunity = {
-                            'ticker': row['Symbol'],
-                            'name': row['Name'],
-                            'price': row['Last'],
-                            'volume': row['Volume'],
-                            'market_cap': row['Market Cap'],
-                            'price_change_50d': price_momentum_50d,
-                            'price_change_200d': price_momentum_200d,
-                            'volume_change_50d': volume_change_50d,
-                            'volume_change_200d': volume_change_200d,
-                            'industry': row['Industry'],
-                            'sector': row['Sector'],
-                            'beta': row['Beta'],
-                            'pe_ratio': row['P/E fwd'],
-                            'price_to_book': row['Price/Book'],
-                            'debt_to_equity': row['Debt/Equity'],
-                            'profit_margin': row['Profit%'],
-                            'revenue_growth_5y': row['5Y Rev%'],
-                            'sales_growth_q': row['Sales %(q)'],
-                            'sales_growth_a': row['Sales %(a)'],
-                            'insider_ownership': row['% Insider'],
-                            'institutional_ownership': row['% Institutional'],
-                            'dividend_yield': row['Div Yield(a)'],
-                            'analyst_rating': row['Analyst Rating'],
-                            'mean_target': row['Mean Target'],
-                            'macd': row['14D MACD'],
-                            'rsi': row['14D Rel Str'],
-                            'timestamp': get_current_time().isoformat(),
-                            'score': self._calculate_opportunity_score({
-                                'price_momentum_50d': price_momentum_50d,
-                                'price_momentum_200d': price_momentum_200d,
-                                'volume_change_50d': volume_change_50d,
-                                'volume_change_200d': volume_change_200d,
-                                'market_cap': row['Market Cap'],
-                                'beta': row['Beta'],
-                                'pe_ratio': row['P/E fwd'],
-                                'profit_margin': row['Profit%'],
-                                'revenue_growth': row['5Y Rev%'],
-                                'analyst_rating': row['Analyst Rating'],
-                                'rsi': row['14D Rel Str']
-                            })
-                        }
-                        opportunities.append(opportunity)
-
-                except Exception as e:
-                    self.logger.warning(f"Error processing row for {row.get('Symbol', 'Unknown')}: {str(e)}")
-                    continue
-
-            # Sort opportunities by score
-            opportunities.sort(key=lambda x: x['score'], reverse=True)
+            # Clean other numeric columns
+            for col in numeric_columns:
+                 if col in df.columns:
+                     df[col] = df[col].apply(self._clean_numeric)
+                 else:
+                     self.logger.warning(f"Numeric column '{col}' not found in input file.")
             
-            self.logger.info(f"Found {len(opportunities)} investment opportunities")
-            return opportunities
+            # --- Calculate Metrics for Price Movement Potential ---
+            
+            # Volume change relative to averages
+            df['volume_change_50d'] = ((df['Volume'] / df['50D Avg Vol']) - 1).fillna(0)
+            df['volume_change_200d'] = ((df['Volume'] / df['200D Avg Vol']) - 1).fillna(0)
+            
+            # Price momentum relative to MAs
+            df['price_momentum_50d'] = ((df['Last'] / df['50D MA']) - 1).fillna(0)
+            df['price_momentum_200d'] = ((df['Last'] / df['200D MA']) - 1).fillna(0)
+            
+            # Rename for clarity if needed (example: RSI)
+            if '14D Rel Str' in df.columns:
+                df.rename(columns={'14D Rel Str': 'rsi'}, inplace=True)
+            elif 'rsi' not in df.columns:
+                 df['rsi'] = 0.5 # Default to neutral if missing
+
+            # Ensure essential columns exist for scoring
+            required_cols = ['Symbol', 'Name', 'Last', 'volume_change_50d', 'volume_change_200d', 
+                             'price_momentum_50d', 'price_momentum_200d', 'rsi', 'Beta']
+            for col in required_cols:
+                if col not in df.columns:
+                     self.logger.warning(f"Required column for scoring '{col}' not found. Filling with default.")
+                     if col == 'Beta':
+                         df[col] = 1.0 # Default Beta
+                     elif col in ['Symbol', 'Name', 'Last']:
+                         # These are critical, drop rows if missing fundamental identifiers
+                         self.logger.error(f"Critical column '{col}' missing. Cannot proceed reliably.")
+                         return pd.DataFrame() # Or handle more gracefully
+                     else:
+                         df[col] = 0.0 # Default other metrics to 0
+
+            return df
 
         except Exception as e:
-            self.logger.error(f"Error processing securities data: {str(e)}")
-            return []
+            self.logger.error(f"Error loading and preparing securities data: {str(e)}", exc_info=True)
+            return pd.DataFrame()
 
-    def _calculate_opportunity_score(self, metrics: Dict) -> float:
-        """Calculate a composite score for an investment opportunity."""
+    def _calculate_price_movement_potential(self, row: pd.Series) -> float:
+        """Calculate a score indicating the potential for significant price movement (magnitude)."""
         try:
-            # Price momentum component (30%)
-            momentum_score = (
-                (max(0, metrics['price_momentum_50d']) * 0.6) +  # Short-term momentum
-                (max(0, metrics['price_momentum_200d']) * 0.4)   # Long-term momentum
-            ) / 100  # Normalize to 0-1 range
+            # Normalize and weight factors contributing to potential movement
             
-            # Volume surge component (20%)
-            volume_score = (
-                (max(0, metrics['volume_change_50d']) * 0.6) +   # Short-term volume
-                (max(0, metrics['volume_change_200d']) * 0.4)     # Long-term volume
-            ) / 200  # Normalize to 0-1 range
+            # 1. Volatility/Beta (25%): Higher beta suggests higher potential volatility
+            beta = row.get('Beta', 1.0) # Default to 1.0 if missing
+            beta_score = min(1.0, max(0, (beta / 2.0))) # Normalize roughly (e.g., beta 2.0 = max score)
             
-            # Market cap tier component (10%)
-            market_cap = metrics['market_cap']
-            if market_cap >= 200e9:  # Mega cap
-                cap_score = 1.0
-            elif market_cap >= 10e9:  # Large cap
-                cap_score = 0.8
-            elif market_cap >= 2e9:   # Mid cap
-                cap_score = 0.6
-            elif market_cap >= 1e9:   # Small cap
-                cap_score = 0.4
-            else:
-                cap_score = 0.2
+            # 2. Price Momentum (Absolute) (35%): Larger distance from MAs indicates potential
+            abs_momentum_50d = abs(row.get('price_momentum_50d', 0))
+            abs_momentum_200d = abs(row.get('price_momentum_200d', 0))
+            # Normalize (e.g., 20% move = max score)
+            norm_momentum_50d = min(1.0, abs_momentum_50d / 0.20) 
+            norm_momentum_200d = min(1.0, abs_momentum_200d / 0.20)
+            momentum_score = (norm_momentum_50d * 0.6) + (norm_momentum_200d * 0.4)
             
-            # Fundamental component (20%)
-            fundamental_score = 0.0
-            if metrics['pe_ratio'] and metrics['pe_ratio'] > 0:
-                pe_score = min(1.0, 30 / metrics['pe_ratio'])  # Lower P/E is better
-                fundamental_score += pe_score * 0.3
+            # 3. Volume Surge (Positive) (25%): High volume increases confidence in moves
+            vol_change_50d = max(0, row.get('volume_change_50d', 0)) # Only consider positive change
+            vol_change_200d = max(0, row.get('volume_change_200d', 0))
+            # Normalize (e.g., 2x average volume = max score)
+            norm_vol_50d = min(1.0, vol_change_50d / 1.0) # 1.0 = 100% increase = 2x avg vol
+            norm_vol_200d = min(1.0, vol_change_200d / 1.0)
+            volume_score = (norm_vol_50d * 0.6) + (norm_vol_200d * 0.4)
             
-            if metrics['profit_margin']:
-                margin_score = min(1.0, metrics['profit_margin'] / 20)  # 20% margin is considered excellent
-                fundamental_score += margin_score * 0.3
-            
-            if metrics['revenue_growth']:
-                growth_score = min(1.0, metrics['revenue_growth'] / 30)  # 30% growth is considered excellent
-                fundamental_score += growth_score * 0.4
-            
-            # Technical component (10%)
-            technical_score = 0.0
-            if metrics['rsi']:
-                rsi = metrics['rsi']
-                if 30 <= rsi <= 70:  # Healthy range
-                    technical_score += 0.5
-                elif rsi < 30:  # Oversold
-                    technical_score += 0.8
-                elif rsi > 70:  # Overbought
-                    technical_score += 0.2
-            
-            # Analyst sentiment component (10%)
-            sentiment_score = 0.0
-            if metrics['analyst_rating']:
-                rating = str(metrics['analyst_rating']).upper()
-                if 'STRONG BUY' in rating:
-                    sentiment_score = 1.0
-                elif 'BUY' in rating:
-                    sentiment_score = 0.8
-                elif 'HOLD' in rating:
-                    sentiment_score = 0.5
-                elif 'SELL' in rating:
-                    sentiment_score = 0.2
-                elif 'STRONG SELL' in rating:
-                    sentiment_score = 0.0
-            
-            # Calculate final score with weights
+            # 4. RSI Extremes (15%): Further from 50 indicates more potential for reversion/trend
+            rsi = row.get('rsi', 0.5) * 100 # Assuming RSI was stored as 0-1
+            rsi_distance = abs(rsi - 50)
+            rsi_score = min(1.0, rsi_distance / 30) # Normalize (e.g., RSI 20 or 80 = max score)
+
+            # Calculate final score
             final_score = (
-                momentum_score * 0.30 +      # Price momentum
-                volume_score * 0.20 +        # Volume surge
-                cap_score * 0.10 +           # Market cap tier
-                fundamental_score * 0.20 +   # Fundamentals
-                technical_score * 0.10 +     # Technical indicators
-                sentiment_score * 0.10       # Analyst sentiment
+                beta_score * 0.25 +
+                momentum_score * 0.35 +
+                volume_score * 0.25 +
+                rsi_score * 0.15
             )
             
             return round(final_score, 4)
             
         except Exception as e:
-            self.logger.warning(f"Error calculating opportunity score: {str(e)}")
+            self.logger.warning(f"Error calculating movement potential for {row.get('Symbol', 'Unknown')}: {str(e)}")
             return 0.0
     
-    def analyze_opportunities(self, opportunities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Analyze opportunities and rank them based on various metrics.
+    def identify_potential_movers(self) -> List[Dict]:
+        """Loads data, calculates movement potential, selects top 10%, and returns them."""
+        df = self.load_and_prepare_securities()
         
-        Args:
-            opportunities: List of opportunity dictionaries
+        if df.empty:
+            self.logger.error("Failed to load or prepare securities data. Cannot identify potential movers.")
+            return []
             
-        Returns:
-            List of analyzed and ranked opportunities
-        """
-        try:
-            analyzed_opportunities = []
-            
-            for opp in opportunities:
-                # Calculate opportunity score
-                score = self._calculate_opportunity_score(opp)
-                
-                # Add analysis results
-                analyzed_opp = opp.copy()
-                analyzed_opp['analysis'] = {
-                    'score': score,
-                    'metrics': {
-                        'volume_significance': self._calculate_volume_significance(opp),
-                        'price_momentum': self._calculate_price_momentum(opp),
-                        'market_cap_significance': self._calculate_market_cap_significance(opp)
-                    }
-                }
-                
-                analyzed_opportunities.append(analyzed_opp)
-            
-            # Sort opportunities by score
-            analyzed_opportunities.sort(key=lambda x: x['analysis']['score'], reverse=True)
-            
-            return analyzed_opportunities
-            
-        except Exception as e:
-            self.logger.error(f"Error analyzing opportunities: {str(e)}")
-            return opportunities
-    
-    def _calculate_volume_significance(self, opportunity: Dict[str, Any]) -> float:
-        """Calculate volume significance score."""
-        try:
-            volume = opportunity.get('volume', 0)
-            volume_change = opportunity.get('volume_change', 0)
-            
-            # Normalize volume
-            volume_score = min(volume / self.min_volume, 1.0)
-            
-            # Normalize volume change
-            change_score = min(volume_change / self.volume_change_threshold, 1.0)
-            
-            # Combine scores
-            return (volume_score * 0.6 + change_score * 0.4)
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating volume significance: {str(e)}")
-            return 0.0
-    
-    def _calculate_price_momentum(self, opportunity: Dict[str, Any]) -> float:
-        """Calculate price momentum score."""
-        try:
-            price_change = abs(opportunity.get('price_change', 0))
-            
-            # Normalize price change
-            return min(price_change / self.price_change_threshold, 1.0)
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating price momentum: {str(e)}")
-            return 0.0
-    
-    def _calculate_market_cap_significance(self, opportunity: Dict[str, Any]) -> float:
-        """Calculate market cap significance score."""
-        try:
-            market_cap = opportunity.get('market_cap', 0)
-            
-            # Normalize market cap
-            return min(market_cap / self.min_market_cap, 1.0)
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating market cap significance: {str(e)}")
-            return 0.0
-    
-    def save_opportunities(self, opportunities: List[Dict[str, Any]]) -> bool:
-        """
-        Save opportunities to a JSON file.
+        # Calculate potential score for each security
+        df['movement_potential_score'] = df.apply(self._calculate_price_movement_potential, axis=1)
         
-        Args:
-            opportunities: List of opportunity dictionaries
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
+        # Sort by score
+        df_sorted = df.sort_values(by='movement_potential_score', ascending=False)
+        
+        # Determine number to select (at least 10%)
+        total_securities = len(df_sorted)
+        num_to_select = max(1, int(total_securities * 0.10)) 
+        
+        self.logger.info(f"Calculated movement potential for {total_securities} securities.")
+        self.logger.info(f"Selecting top {num_to_select} securities (>= 10%) for further analysis.")
+        
+        # Select top N
+        top_securities_df = df_sorted.head(num_to_select)
+        
+        # Convert to list of dictionaries for saving/passing on
+        # Select relevant columns to pass to the Research Analyst
+        columns_to_keep = [
+            'Symbol', 'Name', 'Last', 'Industry', 'Sector', 'Market Cap', 'Volume',
+            'price_momentum_50d', 'price_momentum_200d', 
+            'volume_change_50d', 'volume_change_200d',
+            'rsi', 'Beta', 'movement_potential_score'
+        ]
+        # Filter columns that actually exist in the dataframe
+        existing_columns_to_keep = [col for col in columns_to_keep if col in top_securities_df.columns]
+        
+        potential_movers = top_securities_df[existing_columns_to_keep].to_dict('records')
+        
+        # Add timestamp
+        timestamp = get_current_time().isoformat()
+        for mover in potential_movers:
+            mover['identified_at'] = timestamp
+            # Convert NaN to None for JSON compatibility
+            for key, value in mover.items():
+                 if pd.isna(value):
+                     mover[key] = None
+
+        return potential_movers
+
+    def save_potential_securities(self, securities: List[Dict[str, Any]]) -> bool:
+        """Saves the list of high-potential securities to a JSON file."""
+        if not securities:
+            self.logger.warning("No high-potential securities found or provided to save.")
+            return False
         try:
-            # Load existing opportunities
-            existing_opportunities = []
-            if os.path.exists(self.flagged_opportunities_file):
-                existing_opportunities = load_from_json(self.flagged_opportunities_file) or []
-            
-            # Combine with new opportunities
-            all_opportunities = existing_opportunities + opportunities
-            
-            # Remove duplicates based on ticker and timestamp
-            seen = set()
-            unique_opportunities = []
-            for opp in all_opportunities:
-                # Skip opportunities without required fields
-                if not all(key in opp for key in ['ticker', 'timestamp']):
-                    self.logger.warning(f"Skipping opportunity missing required fields: {opp}")
-                    continue
-                    
-                key = (opp['ticker'], opp['timestamp'])
-                if key not in seen:
-                    seen.add(key)
-                    unique_opportunities.append(opp)
-            
-            if not unique_opportunities:
-                self.logger.warning("No valid opportunities to save")
-                return False
-            
-            # Save to file
-            if save_to_json(unique_opportunities, self.flagged_opportunities_file):
-                self.logger.info(f"Saved {len(unique_opportunities)} opportunities to {self.flagged_opportunities_file}")
+            if save_to_json(securities, self.output_file):
+                self.logger.info(f"Saved {len(securities)} high-potential securities to {self.output_file}")
                 return True
             else:
-                self.logger.error("Failed to save opportunities")
+                self.logger.error(f"Failed to save high-potential securities to {self.output_file}")
                 return False
-                
         except Exception as e:
-            self.logger.error(f"Error saving opportunities: {str(e)}")
+            self.logger.error(f"Error saving high-potential securities: {str(e)}")
             return False
-    
-    def process_securities_file(self, file_path: str) -> bool:
-        """
-        Process a securities data file and save opportunities.
-        
-        Args:
-            file_path: Path to the securities data file
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            # Process securities data
-            opportunities = self.process_securities_data(file_path)
-            
-            if not opportunities:
-                self.logger.warning("No opportunities found in securities data")
-                return False
-            
-            # Analyze opportunities
-            analyzed_opportunities = self.analyze_opportunities(opportunities)
-            
-            if not analyzed_opportunities:
-                self.logger.warning("No analyzed opportunities found")
-                return False
-            
-            # Save analyzed opportunities
-            return self.save_opportunities(analyzed_opportunities)
-            
-        except Exception as e:
-            self.logger.error(f"Error processing securities file: {str(e)}")
-            return False
-    
-    def generate_trade_recommendations(self, opportunities, max_recommendations=None):
-        """Generate trade recommendations from investment opportunities."""
-        try:
-            if not opportunities:
-                self.logger.warning("No opportunities to generate recommendations from")
-                return []
-                
-            # Calculate minimum recommendations (1% of total opportunities)
-            min_recommendations = max(int(len(opportunities) * 0.01), 38)  # At least 38 recommendations (1% of 3800+ stocks)
-            if max_recommendations is None:
-                max_recommendations = max(min_recommendations, 100)  # At least min_recommendations or 100
-                
-            # Sort opportunities by score
-            sorted_opportunities = sorted(opportunities, key=lambda x: x['score'], reverse=True)
-            
-            # Take top opportunities up to max_recommendations
-            recommendations = []
-            for opportunity in sorted_opportunities[:max_recommendations]:
-                # More lenient criteria for recommendations
-                price_momentum = opportunity.get('price_change_50d', 0)
-                volume_change = opportunity.get('volume_change_50d', 0)
-                rsi = opportunity.get('rsi', 50)
-                macd = opportunity.get('macd', 0)
-                score = opportunity.get('score', 0)
-                
-                # Lowered thresholds for action determination
-                if (price_momentum > -2 or  # Allow slightly negative momentum
-                    (rsi < 45 and volume_change > -5) or  # More lenient RSI and volume
-                    macd > -2 or  # Allow slightly negative MACD
-                    score > 0.3):  # Lower score threshold
-                    action = 'BUY'
-                else:
-                    action = 'SELL'
-                
-                # Calculate position size based on market cap and score
-                position_size = self._calculate_position_size(opportunity['market_cap'])
-                position_size = min(position_size * (1 + opportunity['score']), 0.15)
-                
-                recommendation = {
-                    'ticker': opportunity['ticker'],
-                    'name': opportunity['name'],
-                    'action': action,
-                    'score': opportunity['score'],
-                    'position_size': round(position_size, 3),
-                    'current_price': opportunity['price'],
-                    'market_cap': opportunity['market_cap'],
-                    'price_change': price_momentum,
-                    'volume_change': volume_change,
-                    'rationale': self._generate_rationale(opportunity)
-                }
-                recommendations.append(recommendation)
-            
-            # Ensure minimum number of recommendations
-            if len(recommendations) < min_recommendations:
-                self.logger.warning(f"Generated only {len(recommendations)} recommendations, below minimum of {min_recommendations}")
-                # Add more recommendations from remaining opportunities if needed
-                remaining_opportunities = sorted_opportunities[len(recommendations):2*max_recommendations]
-                for opportunity in remaining_opportunities:
-                    if len(recommendations) >= min_recommendations:
-                        break
-                    recommendation = {
-                        'ticker': opportunity['ticker'],
-                        'name': opportunity['name'],
-                        'action': 'BUY' if opportunity.get('score', 0) > 0.2 else 'SELL',
-                        'score': opportunity['score'],
-                        'position_size': round(self._calculate_position_size(opportunity['market_cap']), 3),
-                        'current_price': opportunity['price'],
-                        'market_cap': opportunity['market_cap'],
-                        'price_change': opportunity.get('price_change_50d', 0),
-                        'volume_change': opportunity.get('volume_change_50d', 0),
-                        'rationale': self._generate_rationale(opportunity)
-                    }
-                    recommendations.append(recommendation)
-            
-            # Save recommendations to CSV file
-            csv_filepath = save_recommendations_to_csv(recommendations)
-            self.logger.info(f"Saved recommendations to CSV file: {csv_filepath}")
-            
-            # Also save to JSON for backward compatibility
-            save_to_json(recommendations, 'data/trade_recommendations.json')
-            
-            self.logger.info(f"Generated {len(recommendations)} trade recommendations")
-            return recommendations
-            
-        except Exception as e:
-            self.logger.error(f"Error generating trade recommendations: {str(e)}")
-            return []
-        
-    def _generate_rationale(self, opportunity: Dict) -> str:
-        """Generate a rationale string for the trade recommendation."""
-        try:
-            rationale_parts = []
-            
-            # Price momentum
-            if opportunity['price_change_50d'] > 0:
-                rationale_parts.append(f"Strong upward price momentum ({opportunity['price_change_50d']:.1f}% over 50 days)")
-            else:
-                rationale_parts.append(f"Downward price trend ({opportunity['price_change_50d']:.1f}% over 50 days)")
-                
-            # Volume analysis
-            if opportunity['volume_change_50d'] > 100:
-                rationale_parts.append(f"Exceptional volume surge ({opportunity['volume_change_50d']:.1f}% above 50-day average)")
-            elif opportunity['volume_change_50d'] > 50:
-                rationale_parts.append(f"Strong volume increase ({opportunity['volume_change_50d']:.1f}% above 50-day average)")
-            
-            # Technical indicators
-            if opportunity.get('rsi') > 70:
-                rationale_parts.append("Overbought conditions (RSI > 70)")
-            elif opportunity.get('rsi') < 30:
-                rationale_parts.append("Oversold conditions (RSI < 30)")
-            
-            if opportunity.get('macd') and opportunity.get('macd') > 0:
-                rationale_parts.append("Positive MACD signal")
-            
-            # Fundamental factors
-            if opportunity.get('pe_ratio') and opportunity['pe_ratio'] > 0:
-                if opportunity['pe_ratio'] < 15:
-                    rationale_parts.append("Attractive valuation (low P/E ratio)")
-                elif opportunity['pe_ratio'] > 50:
-                    rationale_parts.append("High valuation (elevated P/E ratio)")
-            
-            if opportunity.get('revenue_growth_5y') and opportunity['revenue_growth_5y'] > 20:
-                rationale_parts.append(f"Strong revenue growth ({opportunity['revenue_growth_5y']:.1f}% over 5 years)")
-            
-            if opportunity.get('profit_margin') and opportunity['profit_margin'] > 0.15:
-                rationale_parts.append(f"Healthy profit margins ({opportunity['profit_margin']*100:.1f}%)")
-            
-            # Market cap consideration
-            market_cap_b = opportunity['market_cap'] / 1_000_000_000
-            if market_cap_b >= 200:
-                rationale_parts.append(f"Mega-cap stock (${market_cap_b:.1f}B market cap)")
-            elif market_cap_b >= 10:
-                rationale_parts.append(f"Large-cap stock (${market_cap_b:.1f}B market cap)")
-            elif market_cap_b >= 2:
-                rationale_parts.append(f"Mid-cap stock (${market_cap_b:.1f}B market cap)")
-            else:
-                rationale_parts.append(f"Small-cap stock (${market_cap_b:.1f}B market cap)")
-            
-            # Combine all rationale parts
-            rationale = " | ".join(rationale_parts)
-            
-            return rationale
-            
-        except Exception as e:
-            self.logger.warning(f"Error generating rationale for {opportunity.get('ticker', 'unknown')}: {str(e)}")
-            return "Technical and fundamental factors indicate a trading opportunity."
 
-    def _calculate_position_size(self, market_cap: float) -> float:
-        """Calculate position size based on market cap."""
-        try:
-            if market_cap >= 10_000_000_000:  # >$10B
-                base_size = 0.10  # Up to 10% of portfolio
-            elif market_cap >= 1_000_000_000:  # >$1B
-                base_size = 0.05  # Up to 5% of portfolio
-            elif market_cap >= 500_000_000:  # >$500M
-                base_size = 0.03  # Up to 3% of portfolio
-            else:
-                base_size = 0.02  # Up to 2% of portfolio
-                
-            return round(base_size, 4)
+    def run_analysis(self) -> bool:
+        """Main entry point to run the full analysis and save results."""
+        self.logger.info("Starting Investment Analyzer: Identifying high price movement potential securities.")
+        potential_movers = self.identify_potential_movers()
+        
+        if not potential_movers:
+             self.logger.warning("Investment Analysis did not identify any securities.")
+             return False
+             
+        success = self.save_potential_securities(potential_movers)
+        
+        if success:
+            self.logger.info("Investment Analyzer finished successfully.")
+        else:
+            self.logger.error("Investment Analyzer finished with errors during saving.")
             
-        except Exception as e:
-            self.logger.error(f"Error calculating position size: {str(e)}")
-            return 0.02  # Default to 2% if there's an error 
+        return success
+
+# Example Usage (Optional - useful for testing this module directly)
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    analyzer = InvestmentAnalyzer()
+    analyzer.run_analysis()
+
+# --- Removed Methods ---
+# - process_securities_data (replaced by load_and_prepare_securities & identify_potential_movers)
+# - _calculate_opportunity_score (replaced by _calculate_price_movement_potential)
+# - analyze_opportunities (logic integrated into identify_potential_movers, helpers removed)
+# - _calculate_volume_significance (removed)
+# - _calculate_price_momentum (removed)
+# - _calculate_market_cap_significance (removed)
+# - save_opportunities (replaced by save_potential_securities)
+# - process_securities_file (replaced by run_analysis)
+# - generate_trade_recommendations (removed - not this class's responsibility)
+# - _generate_rationale (removed)
+# - _calculate_position_size (removed)
+
