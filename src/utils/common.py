@@ -14,6 +14,9 @@ def setup_logging(component_name: str) -> logging.Logger:
     logger = logging.getLogger(component_name)
     logger.setLevel(logging.INFO)
     
+    # Create logs directory if it doesn't exist
+    os.makedirs('logs', exist_ok=True)
+    
     # Create handlers
     c_handler = logging.StreamHandler()
     f_handler = logging.FileHandler(f'logs/{component_name}.log')

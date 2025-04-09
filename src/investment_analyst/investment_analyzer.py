@@ -92,8 +92,8 @@ class InvestmentAnalyzer:
             try:
                 return round(float(value_str.rstrip('%')) / 100.0, 3)
             except ValueError:
-                return 0.0
-                
+                    return 0.0
+
         # Handle K/M/B/T suffixes
         multipliers = {'K': 1000, 'M': 1000000, 'B': 1000000000, 'T': 1000000000000}
         for suffix, multiplier in multipliers.items():
@@ -103,13 +103,13 @@ class InvestmentAnalyzer:
                     return round(number * multiplier, 3)
                 except ValueError:
                     continue
-                    
+
         # Handle regular numbers with commas
         try:
             return round(float(value_str.replace(',', '')), 3)
         except ValueError:
             return 0.0
-
+    
     def _fetch_yf_data(self, ticker: str) -> Dict[str, Any]:
         """
         Fetches necessary data from Yahoo Finance for a ticker.
@@ -276,7 +276,7 @@ class InvestmentAnalyzer:
         Args:
             df (pd.DataFrame, optional): DataFrame containing securities data.
                                       If None, data will be loaded from self.input_file.
-                                      
+            
         Returns:
             pd.DataFrame: Prepared securities data.
         """
@@ -400,16 +400,16 @@ class InvestmentAnalyzer:
             df['price_movement_potential'] = df['price_movement_potential'].clip(0, 1)
 
             return df
-
+                
         except Exception as e:
             self.logger.error(f"Error calculating price movement potential: {str(e)}")
             df['price_movement_potential'] = 0.0
             return df
-
+    
     def identify_potential_movers(self) -> pd.DataFrame:
         """
         Identify securities with high potential for significant price movement.
-        
+            
         Returns:
             pd.DataFrame: Securities with high movement potential.
         """

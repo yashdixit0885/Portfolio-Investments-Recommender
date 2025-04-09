@@ -1,10 +1,54 @@
 """
-Research Analyzer: Risk Scoring Logic Overview (Business)
+Portfolio Risk Analysis Engine
 
-This script analyzes securities that show high potential for price movement 
-and assigns a Risk Score from 0 (lowest risk) to 100 (highest risk). 
-The goal is to help prioritize which securities might be safer or riskier 
-for trading.
+This module is the core engine that calculates risk scores for stocks and securities.
+It provides a comprehensive risk assessment system that helps investors understand
+the risk profile of their investments.
+
+Key Features:
+1. Risk Score Calculation (0-100 scale):
+   - 0-25: Very low risk (stable, established companies)
+   - 26-50: Moderate risk (growing companies with some volatility)
+   - 51-75: High risk (volatile stocks, emerging companies)
+   - 76-100: Very high risk (speculative investments)
+
+2. Risk Factors Considered:
+   - Market Risk:
+     * Price volatility (how much the stock price moves)
+     * Beta (how the stock moves compared to the market)
+     * Maximum drawdown (worst price drop)
+     * Upside vs downside volatility
+   
+   - Financial Risk:
+     * Company size and market capitalization
+     * Debt levels and financial health
+     * Profitability metrics
+     * Cash flow analysis
+   
+   - Sector Risk:
+     * Industry-specific risks
+     * Market position
+     * Competitive landscape
+   
+   - Technical Risk:
+     * Trading volume and liquidity
+     * RSI (Relative Strength Index)
+     * Price momentum
+     * Volume trends
+
+3. Data Sources:
+   - Yahoo Finance API for market data
+   - Company financial statements
+   - Technical indicators
+   - Market statistics
+
+The analyzer uses a weighted scoring system where each risk factor contributes
+to the final risk score based on its importance. This provides a balanced view
+of both fundamental and technical risk factors.
+
+Example Usage:
+    analyzer = ResearchAnalyzer()
+    risk_score = analyzer._calculate_risk_score(security_data)
 """
 
 import os
@@ -31,14 +75,15 @@ class ResearchAnalyzer:
     def __init__(self):
         """Initialize the ResearchAnalyzer."""
         self.logger = setup_logging('research_analyzer')
-        self.data_dir = 'data'
+        # Use root-level data directory
+        self.data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data')
         # Input file from InvestmentAnalyzer
         self.input_file = os.path.join(self.data_dir, 'high_potential_securities.json')
         # Output file for TradeAnalyst
         self.output_file = os.path.join(self.data_dir, 'risk_scored_securities.json')
 
         # Rate limiter for external API calls
-        self.rate_limiter = RateLimiter(calls_per_second=2.0, max_retries=3, retry_delay=5.0)
+        self.rate_limiter = RateLimiter(calls_per_second=6.0, max_retries=3, retry_delay=5.0)
         
         # Cache for fetched yfinance data to reduce API calls
         self.yf_data_cache = {}
@@ -67,8 +112,8 @@ class ResearchAnalyzer:
                 return info_data
 
             def get_history():
-                # Fetch 1 year for volatility/beta calculations
-                hist_data = yf_stock.history(period='1y')
+                # Fetch 2 years for better volatility/beta calculations
+                hist_data = yf_stock.history(period='2y')
                 if hist_data.empty:
                     self.logger.warning(f"No valid history found for {ticker} via yfinance.")
                     return pd.DataFrame()
@@ -90,18 +135,36 @@ class ResearchAnalyzer:
         return yf_data
 
     def _calculate_volatility_metrics(self, history: pd.DataFrame) -> Dict[str, Optional[float]]:
-        """Calculates annualized standard deviation from price history."""
-        volatility = {'std_dev': None}
+        """Calculates comprehensive volatility metrics from price history."""
+        metrics = {
+            'std_dev': None,
+            'max_drawdown': None,
+            'upside_vol': None,
+            'downside_vol': None
+        }
+        
         if not history.empty and 'Close' in history.columns and len(history) > 1:
             try:
                 daily_returns = history['Close'].pct_change().dropna()
                 if not daily_returns.empty:
                     # Annualized standard deviation
-                    std_dev = daily_returns.std() * np.sqrt(252)
-                    volatility['std_dev'] = round(std_dev, 4)
+                    metrics['std_dev'] = daily_returns.std() * np.sqrt(252)
+                    
+                    # Maximum drawdown
+                    cummax = history['Close'].cummax()
+                    drawdown = (history['Close'] - cummax) / cummax
+                    metrics['max_drawdown'] = abs(drawdown.min())
+                    
+                    # Upside and downside volatility
+                    positive_returns = daily_returns[daily_returns > 0]
+                    negative_returns = daily_returns[daily_returns < 0]
+                    
+                    metrics['upside_vol'] = positive_returns.std() * np.sqrt(252) if not positive_returns.empty else 0
+                    metrics['downside_vol'] = abs(negative_returns.std() * np.sqrt(252)) if not negative_returns.empty else 0
             except Exception as e:
-                self.logger.warning(f"Could not calculate volatility: {str(e)}")
-        return volatility
+                self.logger.warning(f"Could not calculate volatility metrics: {str(e)}")
+                
+        return metrics
 
     def _calculate_risk_score(self, security: Dict[str, Any]) -> int:
         """
@@ -124,56 +187,111 @@ class ResearchAnalyzer:
             'debt': 0.5,
             'profitability': 0.5,
             'size': 0.5,
-            'rsi_extreme': 0.0  # Default to low risk if not extreme
+            'rsi_extreme': 0.0,
+            'liquidity': 0.5,
+            'sector': 0.5,
+            'earnings_quality': 0.5,
+            'institutional': 0.5,
+            'short_interest': 0.0
         }
 
         # Calculate Risk Factors
+        # 1. Volatility Risk (Enhanced)
         beta = security.get('Beta')
-        std_dev = None
-        if not yf_history.empty:
-            vol_metrics = self._calculate_volatility_metrics(yf_history)
-            std_dev = vol_metrics.get('std_dev')
-
+        vol_metrics = self._calculate_volatility_metrics(yf_history)
+        
         if beta is not None and beta > 0:
             risk_factors['volatility'] = min(1.0, max(0.0, (beta - 0.5) / 2.0))
-            self.logger.debug(f"{ticker}: Using Beta {beta:.2f} -> Volatility Risk {risk_factors['volatility']:.2f}")
-        elif std_dev is not None and std_dev > 0:
-            risk_factors['volatility'] = min(1.0, max(0.0, (std_dev - 0.15) / 0.60))
-            self.logger.debug(f"{ticker}: Using Std Dev {std_dev:.2f} -> Volatility Risk {risk_factors['volatility']:.2f}")
+        elif vol_metrics['std_dev'] is not None:
+            risk_factors['volatility'] = min(1.0, max(0.0, (vol_metrics['std_dev'] - 0.15) / 0.60))
+            
+        # Add max drawdown risk
+        if vol_metrics['max_drawdown'] is not None:
+            drawdown_risk = min(1.0, max(0.0, vol_metrics['max_drawdown'] / 0.5))
+            risk_factors['volatility'] = max(risk_factors['volatility'], drawdown_risk)
 
-        # Debt Risk
+        # 2. Debt Risk (Enhanced)
         debt_to_equity = yf_info.get('debtToEquity')
+        current_ratio = yf_info.get('currentRatio')
         if debt_to_equity is not None:
             risk_factors['debt'] = min(1.0, max(0.0, (debt_to_equity / 100) / 2.0))
-            self.logger.debug(f"{ticker}: D/E {debt_to_equity:.1f} -> Debt Risk {risk_factors['debt']:.2f}")
+            if current_ratio is not None and current_ratio < 1.0:
+                risk_factors['debt'] = min(1.0, risk_factors['debt'] + 0.2)
 
-        # Profitability Risk
+        # 3. Profitability Risk (Enhanced)
         profit_margin = yf_info.get('profitMargins')
+        operating_margin = yf_info.get('operatingMargins')
         if profit_margin is not None:
             risk_factors['profitability'] = min(1.0, max(0.0, (0.20 - profit_margin) / 0.40))
-            self.logger.debug(f"{ticker}: Margin {profit_margin:.2%} -> Profit Risk {risk_factors['profitability']:.2f}")
+            if operating_margin is not None and operating_margin < 0:
+                risk_factors['profitability'] = min(1.0, risk_factors['profitability'] + 0.2)
 
-        # Size Risk
+        # 4. Size Risk (Enhanced)
         market_cap = security.get('Market Cap')
         if market_cap is not None and market_cap > 0:
             log_cap = np.log10(market_cap)
             risk_factors['size'] = min(1.0, max(0.0, (11.3 - log_cap) / (11.3 - 8.7)))
-            self.logger.debug(f"{ticker}: Cap {market_cap:,.0f} (log={log_cap:.1f}) -> Size Risk {risk_factors['size']:.2f}")
+            # Add volume-based size risk
+            avg_volume = yf_info.get('averageVolume')
+            if avg_volume is not None and avg_volume < 100000:  # Low liquidity threshold
+                risk_factors['size'] = min(1.0, risk_factors['size'] + 0.1)
 
-        # RSI Extreme Risk
+        # 5. RSI Extreme Risk
         rsi_input = security.get('rsi')
         if rsi_input is not None:
             rsi_risk = abs(rsi_input - 0.5) / 0.4
             risk_factors['rsi_extreme'] = min(1.0, max(0.0, rsi_risk))
-            self.logger.debug(f"{ticker}: RSI {rsi_input:.2f} -> RSI Extreme Risk {risk_factors['rsi_extreme']:.2f}")
+
+        # 6. Liquidity Risk
+        avg_volume = yf_info.get('averageVolume')
+        if avg_volume is not None:
+            risk_factors['liquidity'] = min(1.0, max(0.0, (1000000 - avg_volume) / 1000000))
+
+        # 7. Sector Risk
+        sector = yf_info.get('sector')
+        if sector:
+            # Higher risk for more volatile sectors
+            high_risk_sectors = {'Technology', 'Healthcare', 'Biotechnology'}
+            medium_risk_sectors = {'Consumer Cyclical', 'Communication Services', 'Financial Services'}
+            if sector in high_risk_sectors:
+                risk_factors['sector'] = 0.8
+            elif sector in medium_risk_sectors:
+                risk_factors['sector'] = 0.6
+
+        # 8. Earnings Quality
+        earnings_growth = yf_info.get('earningsGrowth')
+        revenue_growth = yf_info.get('revenueGrowth')
+        if earnings_growth is not None and revenue_growth is not None:
+            if earnings_growth < 0 or revenue_growth < 0:
+                risk_factors['earnings_quality'] = 0.8
+            elif earnings_growth < revenue_growth:
+                risk_factors['earnings_quality'] = 0.6
+
+        # 9. Institutional Ownership
+        institution_holding = yf_info.get('heldPercentInstitutions')
+        if institution_holding is not None:
+            if institution_holding < 0.2:
+                risk_factors['institutional'] = 0.8
+            elif institution_holding < 0.5:
+                risk_factors['institutional'] = 0.6
+
+        # 10. Short Interest
+        short_ratio = yf_info.get('shortRatio')
+        if short_ratio is not None:
+            risk_factors['short_interest'] = min(1.0, max(0.0, (short_ratio - 2) / 10))
 
         # Combine Factors with Weights
         weights = {
-            'volatility': 0.30,
-            'debt': 0.25,
-            'profitability': 0.20,
-            'size': 0.15,
-            'rsi_extreme': 0.10
+            'volatility': 0.20,
+            'debt': 0.15,
+            'profitability': 0.12,
+            'size': 0.10,
+            'rsi_extreme': 0.08,
+            'liquidity': 0.10,
+            'sector': 0.08,
+            'earnings_quality': 0.07,
+            'institutional': 0.05,
+            'short_interest': 0.05
         }
 
         total_risk_score_normalized = sum(risk_factors[factor] * weights[factor] for factor in weights)
