@@ -11,32 +11,61 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: [3.8, 3.9, '3.10']
+        python-version: [3.8, 3.9, '3.10', '3.13']
+      fail-fast: false
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
+        cache: 'pip'
     
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pytest pytest-cov pytest-mock
+        pip install pytest pytest-cov pytest-mock pytest-github-actions-annotate-failures
     
-    - name: Run critical tests
+    - name: Create data directories
       run: |
-        pytest -v -m critical --cov=src tests/ --cov-report=xml
+        mkdir -p data
+        mkdir -p output
     
-    - name: Run all tests
+    - name: Run tests with coverage
+      env:
+        PYTHONPATH: ${{ github.workspace }}
       run: |
-        pytest -v --cov=src tests/ --cov-report=xml
+        pytest -v tests/ \
+          --cov=src \
+          --cov-report=xml \
+          --cov-report=term-missing \
+          --junitxml=test-results.xml
     
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v2
+      uses: codecov/codecov-action@v4
       with:
         file: ./coverage.xml
-        fail_ci_if_error: true 
+        fail_ci_if_error: true
+        token: ${{ secrets.CODECOV_TOKEN }}
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.python-version }}
+        path: |
+          test-results.xml
+          coverage.xml
+        retention-days: 30
+    
+    - name: Check coverage threshold
+      run: |
+        COVERAGE=$(python -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(float(root.attrib['line-rate']) * 100)")
+        if (( $(echo "$COVERAGE < 60" | bc -l) )); then
+          echo "Coverage $COVERAGE% is below threshold of 60%"
+          exit 1
+        fi
+        echo "Coverage $COVERAGE% is above threshold of 60%" 

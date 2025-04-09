@@ -282,10 +282,10 @@ class TradeAnalyzer:
 
         trade_recommendations = []
         for security in securities:
-            ticker = security.get('Symbol')
+            ticker = security.get('Ticker')
             risk_score = security.get('risk_score', 'N/A')
             if not ticker:
-                self.logger.warning("Skipping security with missing Symbol.")
+                self.logger.warning("Skipping security with missing Ticker.")
                 continue
 
             self.logger.info(f"Analyzing {ticker} (Risk: {risk_score})...")

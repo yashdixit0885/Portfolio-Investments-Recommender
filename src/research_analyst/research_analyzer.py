@@ -108,10 +108,10 @@ class ResearchAnalyzer:
         Calculates a risk score (0-100) for a single security.
         Higher score means higher risk.
         """
-        ticker = security.get('Symbol')
+        ticker = security.get('Ticker')
         if not ticker:
-            self.logger.warning("Security missing Symbol, cannot calculate risk.")
-            return 75  # Assign higher risk if symbol is missing
+            self.logger.warning("Security missing Ticker, cannot calculate risk.")
+            return 75  # Assign higher risk if ticker is missing
 
         # Fetch required data from yfinance
         yf_data = self._fetch_yf_data(ticker)

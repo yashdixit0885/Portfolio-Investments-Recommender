@@ -21,7 +21,7 @@ class TestTradeAnalyzer:
             "analysis_timestamp": "2023-04-08T12:00:00",
             "risk_scored_securities": [
                 {
-                    'Symbol': 'AAPL',
+                    'Ticker': 'AAPL',
                     'Name': 'Apple Inc',
                     'Last': 150.0,
                     'Industry': 'Technology',
@@ -37,7 +37,7 @@ class TestTradeAnalyzer:
                     'risk_score': 30
                 },
                 {
-                    'Symbol': 'MSFT',
+                    'Ticker': 'MSFT',
                     'Name': 'Microsoft Corp',
                     'Last': 280.0,
                     'Industry': 'Technology',
