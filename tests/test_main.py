@@ -2,8 +2,9 @@ import os
 import pytest
 import pandas as pd
 import json
+import logging
 from unittest.mock import patch, MagicMock
-from src.main import run_analysis_cycle
+from src.main import run_analysis_cycle, setup_environment, main
 from src.investment_analyst.investment_analyzer import InvestmentAnalyzer
 from src.research_analyst.research_analyzer import ResearchAnalyzer
 from src.trade_analyst.trade_analyzer import TradeAnalyzer
@@ -121,6 +122,37 @@ class TestMainApplication:
             'Close': [145.5, 146.5, 147.5, 148.5, 149.5, 150.5],
             'Volume': [1000000, 1100000, 1200000, 1300000, 1400000, 1500000]
         })
+
+    def test_setup_environment(self):
+        """Test the setup_environment function."""
+        with patch('src.main.load_dotenv') as mock_load_dotenv, \
+             patch('src.main.setup_logging') as mock_setup_logging:
+            
+            # Configure mock return values
+            mock_setup_logging.return_value = MagicMock()
+            
+            # Run the function
+            result = setup_environment()
+            
+            # Verify the function was called
+            mock_load_dotenv.assert_called_once()
+            mock_setup_logging.assert_called_once_with('main')
+            assert result is True
+
+    def test_setup_environment_failure(self):
+        """Test setup_environment when logging setup fails."""
+        with patch('src.main.load_dotenv'), \
+             patch('src.main.setup_logging', side_effect=Exception("Logging setup failed")), \
+             patch('src.main.logging.error') as mock_error:
+            
+            # Run the function
+            result = setup_environment()
+            
+            # Verify the result
+            assert result is False
+            
+            # Verify error was logged
+            mock_error.assert_called_once()
     
     def test_run_analysis_cycle(self):
         """Test the run_analysis_cycle function."""
@@ -144,4 +176,113 @@ class TestMainApplication:
             # Verify all methods were called exactly once
             mock_investment_instance.run_analysis.assert_called_once()
             mock_research_instance.run_risk_analysis.assert_called_once()
-            mock_trade_instance.generate_trade_signals.assert_called_once() 
+            mock_trade_instance.generate_trade_signals.assert_called_once()
+
+    def test_run_analysis_cycle_investment_failure(self):
+        """Test run_analysis_cycle when investment analysis fails."""
+        with patch('src.main.InvestmentAnalyzer') as mock_investment, \
+             patch('src.main.ResearchAnalyzer') as mock_research, \
+             patch('src.main.TradeAnalyzer') as mock_trade:
+            
+            # Setup mock return values
+            mock_investment_instance = mock_investment.return_value
+            mock_research_instance = mock_research.return_value
+            mock_trade_instance = mock_trade.return_value
+            
+            mock_investment_instance.run_analysis.return_value = False
+            
+            # Run the function
+            run_analysis_cycle()
+            
+            # Verify only investment analysis was called
+            mock_investment_instance.run_analysis.assert_called_once()
+            mock_research_instance.run_risk_analysis.assert_not_called()
+            mock_trade_instance.generate_trade_signals.assert_not_called()
+
+    def test_run_analysis_cycle_research_failure(self):
+        """Test run_analysis_cycle when research analysis fails."""
+        with patch('src.main.InvestmentAnalyzer') as mock_investment, \
+             patch('src.main.ResearchAnalyzer') as mock_research, \
+             patch('src.main.TradeAnalyzer') as mock_trade:
+            
+            # Setup mock return values
+            mock_investment_instance = mock_investment.return_value
+            mock_research_instance = mock_research.return_value
+            mock_trade_instance = mock_trade.return_value
+            
+            mock_investment_instance.run_analysis.return_value = True
+            mock_research_instance.run_risk_analysis.return_value = False
+            
+            # Run the function
+            run_analysis_cycle()
+            
+            # Verify investment and research analysis were called
+            mock_investment_instance.run_analysis.assert_called_once()
+            mock_research_instance.run_risk_analysis.assert_called_once()
+            mock_trade_instance.generate_trade_signals.assert_not_called()
+
+    def test_run_analysis_cycle_trade_failure(self):
+        """Test run_analysis_cycle when trade analysis fails."""
+        with patch('src.main.InvestmentAnalyzer') as mock_investment, \
+             patch('src.main.ResearchAnalyzer') as mock_research, \
+             patch('src.main.TradeAnalyzer') as mock_trade:
+            
+            # Setup mock return values
+            mock_investment_instance = mock_investment.return_value
+            mock_research_instance = mock_research.return_value
+            mock_trade_instance = mock_trade.return_value
+            
+            mock_investment_instance.run_analysis.return_value = True
+            mock_research_instance.run_risk_analysis.return_value = True
+            mock_trade_instance.generate_trade_signals.return_value = False
+            
+            # Run the function
+            run_analysis_cycle()
+            
+            # Verify all methods were called
+            mock_investment_instance.run_analysis.assert_called_once()
+            mock_research_instance.run_risk_analysis.assert_called_once()
+            mock_trade_instance.generate_trade_signals.assert_called_once()
+
+    def test_run_analysis_cycle_exception_handling(self):
+        """Test run_analysis_cycle exception handling."""
+        with patch('src.main.InvestmentAnalyzer') as mock_investment, \
+             patch('src.main.ResearchAnalyzer') as mock_research, \
+             patch('src.main.TradeAnalyzer') as mock_trade:
+            
+            # Setup mock to raise an exception
+            mock_investment_instance = mock_investment.return_value
+            mock_investment_instance.run_analysis.side_effect = Exception("Test error")
+            
+            # Run the function and verify it doesn't raise an exception
+            run_analysis_cycle()
+
+    def test_main_function(self):
+        """Test the main function."""
+        with patch('src.main.setup_environment') as mock_setup, \
+             patch('src.main.run_analysis_cycle') as mock_run:
+            
+            # Setup mock return values
+            mock_setup.return_value = True
+            
+            # Run the main function
+            main()
+            
+            # Verify the functions were called
+            mock_setup.assert_called_once()
+            mock_run.assert_called_once()
+
+    def test_main_function_setup_failure(self):
+        """Test the main function when setup fails."""
+        with patch('src.main.setup_environment') as mock_setup, \
+             patch('src.main.run_analysis_cycle') as mock_run:
+            
+            # Setup mock return values
+            mock_setup.return_value = False
+            
+            # Run the main function
+            main()
+            
+            # Verify setup was called but run_analysis_cycle was not
+            mock_setup.assert_called_once()
+            mock_run.assert_not_called() 

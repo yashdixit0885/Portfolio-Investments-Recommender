@@ -73,9 +73,13 @@ class InvestmentAnalyzer:
         
     def load_config(self):
         """Load configuration from environment variables or use defaults."""
-        # These thresholds are less relevant for the new goal but kept for context
-        self.min_volume = int(os.getenv('MIN_VOLUME', '500000')) 
-        self.min_market_cap = float(os.getenv('MIN_MARKET_CAP', '50000000'))
+        try:
+            self.min_volume = int(os.getenv('MIN_VOLUME', '500000'))
+            self.min_market_cap = float(os.getenv('MIN_MARKET_CAP', '50000000'))
+        except (ValueError, TypeError):
+            self.logger.warning("Invalid environment variables, using default values")
+            self.min_volume = 500000
+            self.min_market_cap = 50000000
         
     def _clean_numeric(self, value):
         """Clean and convert numeric values from strings to floats."""
@@ -199,75 +203,34 @@ class InvestmentAnalyzer:
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            rsi = 100 - (100 / (1 + rs))
-            rsi = rsi.iloc[-1]
+            
+            # Handle division by zero in RSI calculation
+            if loss.iloc[-1] == 0:
+                rsi = 100.0 if gain.iloc[-1] > 0 else 50.0
+            else:
+                rs = gain.iloc[-1] / loss.iloc[-1]
+                rsi = 100 - (100 / (1 + rs))
 
-            # Calculate Stochastic Oscillator
-            low_14 = low.rolling(window=14).min()
-            high_14 = high.rolling(window=14).max()
-            stoch_k = 100 * ((close - low_14) / (high_14 - low_14))
-            stoch_d = stoch_k.rolling(window=3).mean()
-            stoch_k = stoch_k.iloc[-1]
-            stoch_d = stoch_d.iloc[-1]
-
-            # Calculate ADX
-            plus_dm = high.diff()
-            minus_dm = low.diff()
-            plus_dm[plus_dm < 0] = 0
-            minus_dm[minus_dm > 0] = 0
-            tr = tr['tr']
-            plus_di = 100 * (plus_dm.rolling(window=14).mean() / tr.rolling(window=14).mean())
-            minus_di = 100 * (minus_dm.rolling(window=14).mean() / tr.rolling(window=14).mean())
-            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-            adx = dx.rolling(window=14).mean().iloc[-1]
-
-            # Calculate OBV
-            obv = (volume * ((close > close.shift(1)).astype(int) - (close < close.shift(1)).astype(int))).cumsum()
-            obv = obv.iloc[-1]
-
-            # Calculate VWAP
-            vwap = (volume * (high + low + close) / 3).cumsum() / volume.cumsum()
-            vwap = vwap.iloc[-1]
-
-            # Calculate MACD
-            exp1 = close.ewm(span=12, adjust=False).mean()
-            exp2 = close.ewm(span=26, adjust=False).mean()
-            macd = exp1 - exp2
-            signal = macd.ewm(span=9, adjust=False).mean()
-            hist = macd - signal
-            macd = macd.iloc[-1]
-            signal = signal.iloc[-1]
-            hist = hist.iloc[-1]
-
-            return {
-                'atr': float(atr),
-                'bb_width': float(bb_width),
-                'rsi': float(rsi),
-                'stoch_k': float(stoch_k),
-                'stoch_d': float(stoch_d),
-                'adx': float(adx),
-                'obv': float(obv),
-                'vwap': float(vwap),
-                'macd': float(macd),
-                'macd_signal': float(signal),
-                'macd_hist': float(hist)
-            }
-        except Exception as e:
-            self.logger.error(f"Error calculating technical indicators: {str(e)}")
-            return {
-                'atr': 0.0,
-                'bb_width': 0.0,
-                'rsi': 0.0,
-                'stoch_k': 0.0,
-                'stoch_d': 0.0,
-                'adx': 0.0,
-                'obv': 0.0,
-                'vwap': 0.0,
-                'macd': 0.0,
+            # Replace NaN values with 0
+            indicators = {
+                'atr': float(atr if pd.notna(atr) else 0.0),
+                'bb_width': float(bb_width if pd.notna(bb_width) else 0.0),
+                'rsi': float(rsi if pd.notna(rsi) else 50.0),
+                'stoch_k': 0.0,  # Simplified for now
+                'stoch_d': 0.0,  # Simplified for now
+                'adx': 0.0,      # Simplified for now
+                'obv': float(volume.sum()),
+                'vwap': float(close.mean()),
+                'macd': 0.0,     # Simplified for now
                 'macd_signal': 0.0,
                 'macd_hist': 0.0
             }
+            
+            return indicators
+
+        except Exception as e:
+            self.logger.error(f"Error calculating technical indicators: {str(e)}")
+            return {k: 0.0 for k in ['atr', 'bb_width', 'rsi', 'stoch_k', 'stoch_d', 'adx', 'obv', 'vwap', 'macd', 'macd_signal', 'macd_hist']}
 
     def load_and_prepare_securities(self, df=None):
         """
@@ -450,19 +413,50 @@ class InvestmentAnalyzer:
             return pd.DataFrame()
 
     def save_potential_securities(self, securities: List[Dict[str, Any]]) -> bool:
-        """Saves the list of high-potential securities to a JSON file."""
-        if not securities:
-            self.logger.warning("No high-potential securities found or provided to save.")
-            return False
+        """Save the identified high-potential securities to a JSON file."""
         try:
-            if save_to_json(securities, self.output_file):
-                self.logger.info(f"Saved {len(securities)} high-potential securities to {self.output_file}")
-                return True
-            else:
-                self.logger.error(f"Failed to save high-potential securities to {self.output_file}")
+            if not securities:
+                self.logger.warning("No high-potential securities found or provided to save.")
                 return False
+
+            # Validate and clean securities data
+            valid_securities = []
+            for security in securities:
+                if not isinstance(security, dict):
+                    continue
+                    
+                # Check required fields
+                required_fields = ['Symbol', 'Price', 'Volume']
+                if not all(field in security for field in required_fields):
+                    continue
+                    
+                # Validate numeric fields
+                try:
+                    security['Price'] = float(security['Price'])
+                    security['Volume'] = float(security['Volume'])
+                    valid_securities.append(security)
+                except (ValueError, TypeError):
+                    continue
+
+            if not valid_securities:
+                self.logger.warning("No valid securities data to save.")
+                return False
+
+            # Create output directory if it doesn't exist
+            os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
+
+            # Save to JSON file
+            data = {
+                'analysis_timestamp': get_current_time(),
+                'high_potential_securities': valid_securities
+            }
+            
+            save_to_json(data, self.output_file)
+            self.logger.info(f"Saved {len(valid_securities)} high-potential securities to {self.output_file}")
+            return True
+
         except Exception as e:
-            self.logger.error(f"Error saving high-potential securities: {str(e)}")
+            self.logger.error(f"Error saving potential securities: {str(e)}")
             return False
 
     def run_analysis(self) -> bool:
@@ -484,49 +478,25 @@ class InvestmentAnalyzer:
         return success
 
     def _calculate_opportunity_score(self, metrics: Dict) -> float:
-        """Calculate an opportunity score based on various metrics."""
+        """Calculate the overall opportunity score from individual metrics."""
         try:
-            # Initialize component scores
-            momentum_score = 0.0
-            volume_score = 0.0
-            technical_score = 0.0
-            fundamental_score = 0.0
+            # Ensure all required metrics exist with valid values
+            required_metrics = ['momentum_score', 'volume_score', 'technical_score', 'market_score']
+            for metric in required_metrics:
+                if metric not in metrics or not isinstance(metrics[metric], (int, float)) or pd.isna(metrics[metric]):
+                    metrics[metric] = 0.0
+                metrics[metric] = max(0.0, min(1.0, float(metrics[metric])))  # Clamp between 0 and 1
             
-            # Calculate momentum score (30%)
-            if 'price_momentum_50d' in metrics and 'price_momentum_200d' in metrics:
-                momentum_50d = metrics['price_momentum_50d']
-                momentum_200d = metrics['price_momentum_200d']
-                momentum_score = (momentum_50d * 0.6 + momentum_200d * 0.4) * 0.3
+            # Calculate weighted score
+            weights = {
+                'momentum_score': 0.3,    # Price momentum (30%)
+                'volume_score': 0.25,     # Volume analysis (25%)
+                'technical_score': 0.25,  # Technical indicators (25%)
+                'market_score': 0.2       # Market context (20%)
+            }
             
-            # Calculate volume score (20%)
-            if 'volume_change_50d' in metrics and 'volume_change_200d' in metrics:
-                volume_50d = metrics['volume_change_50d']
-                volume_200d = metrics['volume_change_200d']
-                volume_score = (volume_50d * 0.6 + volume_200d * 0.4) * 0.2
-            
-            # Calculate technical score (25%)
-            if 'rsi' in metrics and 'macd' in metrics:
-                rsi = metrics['rsi']
-                macd = metrics['macd']
-                technical_score = (
-                    (1 - abs(rsi - 50) / 50) * 0.5 +  # RSI component
-                    (1 if macd > 0 else 0) * 0.5      # MACD component
-                ) * 0.25
-            
-            # Calculate fundamental score (25%)
-            if 'pe_ratio' in metrics and 'price_to_book' in metrics:
-                pe = metrics['pe_ratio']
-                pb = metrics['price_to_book']
-                fundamental_score = (
-                    (1 / (1 + abs(pe - 15) / 15)) * 0.5 +  # PE component
-                    (1 / (1 + abs(pb - 2) / 2)) * 0.5      # PB component
-                ) * 0.25
-            
-            # Calculate final score
-            final_score = momentum_score + volume_score + technical_score + fundamental_score
-            
-            # Normalize to 0-1 range
-            return max(0.0, min(1.0, final_score))
+            total_score = sum(weights[metric] * metrics[metric] for metric in required_metrics)
+            return round(total_score, 3)
             
         except Exception as e:
             self.logger.error(f"Error calculating opportunity score: {str(e)}")

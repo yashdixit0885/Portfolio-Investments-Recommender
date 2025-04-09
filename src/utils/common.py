@@ -8,44 +8,49 @@ import shutil
 import re
 from typing import Dict, List, Any, Union, Optional
 from datetime import datetime
+from pathlib import Path
 
 def setup_logging(component_name: str) -> logging.Logger:
-    """Setup logging for a component"""
-    logger = logging.getLogger(component_name)
-    logger.setLevel(logging.INFO)
-    
+    """Set up logging for a component."""
     # Create logs directory if it doesn't exist
     os.makedirs('logs', exist_ok=True)
     
-    # Create handlers
-    c_handler = logging.StreamHandler()
-    f_handler = logging.FileHandler(f'logs/{component_name}.log')
+    # Configure logger
+    logger = logging.getLogger(component_name)
+    logger.setLevel(logging.INFO)
     
-    # Create formatters
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    c_handler.setFormatter(formatter)
-    f_handler.setFormatter(formatter)
+    # Clear existing handlers
+    logger.handlers = []
     
-    # Add handlers to logger
-    logger.addHandler(c_handler)
-    logger.addHandler(f_handler)
+    # Add console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
+    # Add file handler
+    file_handler = logging.FileHandler(f'logs/{component_name}.log')
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
     
     return logger
 
-def get_current_time(timezone: Optional[str] = None) -> datetime:
-    """
-    Get the current time in the specified timezone or UTC if no timezone is provided.
+def get_current_time(timezone=None):
+    """Get current time in specified timezone or UTC."""
+    if timezone == '':
+        raise pytz.exceptions.UnknownTimeZoneError('Empty timezone string')
+        
+    if not timezone:
+        return datetime.now(pytz.UTC)
     
-    Args:
-        timezone: Optional timezone string (e.g., 'America/New_York', 'America/Denver')
-                 If None, returns UTC time
-    
-    Returns:
-        datetime: Current time in specified timezone or UTC
-    """
-    if timezone:
-        return datetime.now(pytz.timezone(timezone))
-    return datetime.now(pytz.UTC)
+    try:
+        tz = pytz.timezone(timezone)
+        return datetime.now(tz)
+    except pytz.exceptions.UnknownTimeZoneError:
+        raise
 
 class DateTimeEncoder(json.JSONEncoder):
     """Custom JSON encoder for datetime objects"""
@@ -69,15 +74,11 @@ def save_to_json(data: Union[Dict[str, Any], List[Any]], filepath: str) -> bool:
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         
-        # Save data using custom encoder
         with open(filepath, 'w') as f:
-            json.dump(data, f, indent=4, cls=DateTimeEncoder)
-            
+            json.dump(data, f, cls=DateTimeEncoder)
         return True
-        
     except Exception as e:
-        logger = logging.getLogger('utils')
-        logger.error(f"Error saving to {filepath}: {str(e)}")
+        logging.error(f"Error saving to JSON: {str(e)}")
         return False
 
 def load_from_json(filepath: str) -> Optional[Union[Dict[str, Any], List[Any]]]:
@@ -92,39 +93,82 @@ def load_from_json(filepath: str) -> Optional[Union[Dict[str, Any], List[Any]]]:
     """
     try:
         if not os.path.exists(filepath):
-            logger = logging.getLogger('utils')
-            logger.warning(f"File not found: {filepath}")
             return None
             
         with open(filepath, 'r') as f:
-            data = json.load(f)
-            
-        return data
-        
-    except json.JSONDecodeError as e:
-        logger = logging.getLogger('utils')
-        logger.error(f"Error decoding JSON from {filepath}: {str(e)}")
-        return None
-        
+            return json.load(f)
     except Exception as e:
-        logger = logging.getLogger('utils')
-        logger.error(f"Error loading from {filepath}: {str(e)}")
+        logging.error(f"Error loading from JSON: {str(e)}")
         return None
 
 def format_currency(amount: float) -> str:
     """Format currency amount"""
-    return f"${amount:,.2f}"
+    if amount is None:
+        return '$0.00'
+    if isinstance(amount, (int, float)):
+        if amount != amount:  # Check for NaN
+            return '$nan'
+        if amount == float('inf'):
+            return '$inf'
+        if amount == float('-inf'):
+            return '$-inf'
+        return f"${amount:,.2f}"
+    return '$0.00'
 
 def calculate_percentage_change(old_value: float, new_value: float) -> float:
     """Calculate percentage change between two values"""
     if old_value == 0:
         return 0
-    return ((new_value - old_value) / old_value) * 100
+    return ((new_value - old_value) / abs(old_value)) * 100
 
-def validate_email(email: str) -> bool:
-    """Validate email format"""
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return bool(re.match(pattern, email))
+def validate_email(email):
+    """Validate email format."""
+    if not email:
+        return False
+    
+    try:
+        # Split email into local and domain parts
+        local, domain = email.split('@')
+        
+        # Check local part
+        if not local or len(local) > 64:
+            return False
+        
+        # Check for consecutive dots
+        if '..' in local or '..' in domain:
+            return False
+        
+        # Check domain part
+        if not domain or len(domain) > 255:
+            return False
+        
+        # Check domain parts
+        domain_parts = domain.split('.')
+        if len(domain_parts) < 2:
+            return False
+            
+        # Check TLD length (last part)
+        tld = domain_parts[-1]
+        if not tld or len(tld) < 2:
+            return False
+            
+        # Allow international domains and regular domains
+        for part in domain_parts:
+            if not part:
+                return False
+            # Check if it's a punycode domain
+            try:
+                part.encode('ascii')
+            except UnicodeEncodeError:
+                # International domain part, which is valid
+                continue
+            # Regular ASCII domain part validation
+            if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$', part):
+                return False
+                
+        return True
+    except Exception:
+        return False
 
 def save_recommendations_to_csv(recommendations: List[Dict[str, Any]], output_dir: str = "Output") -> str:
     """
@@ -139,78 +183,63 @@ def save_recommendations_to_csv(recommendations: List[Dict[str, Any]], output_di
     """
     try:
         # Create output directory if it doesn't exist
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-            
-        # Handle archiving and cleanup based on time
-        archive_and_cleanup_files(output_dir)
-            
-        # Format the data for CSV
-        csv_data = []
-        for rec in recommendations:
-            csv_data.append({
-                'Ticker': rec.get('ticker', ''),
-                'Company': rec.get('name', ''),
-                'Action': rec.get('action', ''),
-                'Score': rec.get('score', 0.0),
-                'Position Size': rec.get('position_size', 0.0),
-                'Current Price': rec.get('price', 0.0),
-                'Market Cap': rec.get('market_cap', 0),
-                'Price Change': rec.get('price_change', 0.0),
-                'Volume Change': rec.get('volume_change', 0.0),
-                'Rationale': rec.get('rationale', '')
-            })
-            
-        # Create DataFrame and save to CSV
-        df = pd.DataFrame(csv_data)
-        current_date = get_current_time().strftime('%Y%m%d')
-        filename = f'trade_recommendations_{current_date}.csv'
-        filepath = os.path.join(output_dir, filename)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if not recommendations:
+            # Create empty file
+            filepath = os.path.join(output_dir, 'recommendations.csv')
+            with open(filepath, 'w') as f:
+                f.write('ticker,name,action,score,position_size,price,market_cap,price_change,volume_change,rationale\n')
+            return filepath
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(recommendations)
+        
+        # Save to CSV
+        filepath = os.path.join(output_dir, 'recommendations.csv')
         df.to_csv(filepath, index=False)
-        logging.info(f"Saved {len(recommendations)} recommendations to {filepath}")
-        
         return filepath
-        
     except Exception as e:
-        logging.error(f"Error saving recommendations to CSV: {str(e)}")
+        logging.error(f"Error saving recommendations: {str(e)}")
         raise
 
-def archive_and_cleanup_files(output_dir: str = "Output", archive_dir: str = "Archive") -> None:
-    """
-    Archive files at 5 PM MT and clean up at 7 AM MT.
-    
-    Args:
-        output_dir: Directory containing output files
-        archive_dir: Directory for archived files
-    """
+def archive_and_cleanup_files(output_dir, archive_dir):
+    """Archive files at 5 PM MT and cleanup at 7 AM MT."""
     try:
-        current_time = get_current_time('America/Denver')  # Mountain Time
+        current_time = get_current_time('America/Denver')
+        hour = current_time.hour
         
-        # Create archive directory if it doesn't exist
-        if not os.path.exists(archive_dir):
-            os.makedirs(archive_dir)
+        if hour == 17:  # 5 PM MT
+            # Archive files
+            date_str = current_time.strftime('%Y%m%d')
+            date_dir = os.path.join(archive_dir, date_str)
+            os.makedirs(date_dir, exist_ok=True)
             
-        # At 5 PM MT - Archive files
-        if current_time.hour == 17:
-            for file in os.listdir(output_dir):
-                if file.endswith('.csv') or file.endswith('.json'):
-                    # Create archive subfolder with date
-                    date_folder = os.path.join(archive_dir, current_time.strftime('%Y%m%d'))
-                    if not os.path.exists(date_folder):
-                        os.makedirs(date_folder)
+            for filename in os.listdir(output_dir):
+                if filename.endswith(('.csv', '.json')):
+                    src = os.path.join(output_dir, filename)
+                    dst = os.path.join(date_dir, filename)
+                    try:
+                        if os.access(src, os.W_OK):
+                            os.rename(src, dst)
+                        else:
+                            logging.warning(f"Could not archive read-only file: {src}")
+                    except (PermissionError, OSError) as e:
+                        logging.warning(f"Could not archive file {src}: {str(e)}")
                     
-                    # Move file to archive
-                    src = os.path.join(output_dir, file)
-                    dst = os.path.join(date_folder, file)
-                    shutil.move(src, dst)
-                    logging.info(f"Archived {file} to {date_folder}")
-                    
-        # At 7 AM MT - Clean up output directory
-        elif current_time.hour == 7:
-            for file in os.listdir(output_dir):
-                if file.endswith('.csv') or file.endswith('.json'):
-                    os.remove(os.path.join(output_dir, file))
-                    logging.info(f"Cleaned up {file} from {output_dir}")
+        elif hour == 7:  # 7 AM MT
+            # Cleanup files
+            for filename in os.listdir(output_dir):
+                if filename.endswith(('.csv', '.json')):
+                    filepath = os.path.join(output_dir, filename)
+                    try:
+                        if os.access(filepath, os.W_OK):
+                            os.remove(filepath)
+                        else:
+                            logging.warning(f"Could not remove read-only file: {filepath}")
+                    except (PermissionError, OSError) as e:
+                        logging.warning(f"Could not remove file {filepath}: {str(e)}")
                     
     except Exception as e:
         logging.error(f"Error in archive_and_cleanup_files: {str(e)}")
+        raise

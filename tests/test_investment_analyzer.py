@@ -268,24 +268,32 @@ class TestInvestmentAnalyzer:
         # Set up test data
         analyzer.output_file = str(tmp_path / "test_output.json")
         test_securities = [
-            {'Ticker': 'AAPL', 'Score': 0.8},
-            {'Ticker': 'GOOGL', 'Score': 0.7}
+            {
+                'Symbol': 'AAPL',
+                'Price': 150.0,
+                'Volume': 1000000,
+                'movement_potential_score': 0.8
+            },
+            {
+                'Symbol': 'GOOGL',
+                'Price': 2800.0,
+                'Volume': 500000,
+                'movement_potential_score': 0.7
+            }
         ]
 
         # Test successful save
         result = analyzer.save_potential_securities(test_securities)
         assert result is True
-        assert os.path.exists(analyzer.output_file)
 
-        # Verify file contents
+        # Verify the saved file
         with open(analyzer.output_file, 'r') as f:
             saved_data = json.load(f)
-            assert len(saved_data) == 2
-            assert saved_data[0]['Ticker'] == 'AAPL'
-
-        # Test with empty list
-        result = analyzer.save_potential_securities([])
-        assert result is False
+            assert 'analysis_timestamp' in saved_data
+            assert 'high_potential_securities' in saved_data
+            assert len(saved_data['high_potential_securities']) == 2
+            assert saved_data['high_potential_securities'][0]['Symbol'] == 'AAPL'
+            assert saved_data['high_potential_securities'][1]['Symbol'] == 'GOOGL'
 
     def test_run_analysis(self, analyzer):
         """Test the run_analysis method."""
@@ -326,4 +334,160 @@ class TestInvestmentAnalyzer:
         with patch('pandas.Series.mean', side_effect=Exception("Mean Error")):
             result = analyzer._calculate_opportunity_score(pd.DataFrame())
             assert isinstance(result, float)
-            assert result == 0.0 
+            assert result == 0.0
+
+    def test_rate_limiter_integration(self, analyzer):
+        """Test the integration with rate limiter in _fetch_yf_data."""
+        # Mock the rate limiter
+        with patch.object(analyzer.rate_limiter, 'call_with_retry') as mock_retry:
+            # Mock successful API calls
+            mock_retry.side_effect = [
+                {'regularMarketPrice': 150.0},  # info call
+                pd.DataFrame({  # history call
+                    'Close': [150.0],
+                    'High': [155.0],
+                    'Low': [145.0],
+                    'Volume': [1000000]
+                })
+            ]
+            
+            result = analyzer._fetch_yf_data('AAPL')
+            assert 'info' in result
+            assert 'history' in result
+            assert mock_retry.call_count == 2  # Called for both info and history
+            
+            # Test rate limiter retry on failure
+            mock_retry.side_effect = Exception("API Error")
+            result = analyzer._fetch_yf_data('INVALID')
+            assert result['info'] == {}
+            assert result['history'].empty
+            
+            # Test cache functionality
+            mock_retry.reset_mock()
+            result = analyzer._fetch_yf_data('AAPL')  # Should use cache
+            assert mock_retry.call_count == 0
+
+    def test_technical_indicators_edge_cases(self, analyzer):
+        """Test edge cases in technical indicator calculations."""
+        # Test with empty DataFrame
+        empty_df = pd.DataFrame()
+        indicators = analyzer._calculate_technical_indicators(empty_df)
+        assert all(v == 0.0 for v in indicators.values())
+        
+        # Test with insufficient data points
+        short_df = pd.DataFrame({
+            'Close': [100.0] * 5,
+            'High': [105.0] * 5,
+            'Low': [95.0] * 5,
+            'Volume': [1000000] * 5
+        })
+        indicators = analyzer._calculate_technical_indicators(short_df)
+        assert all(v == 0.0 for v in indicators.values())
+        
+        # Test with all identical prices
+        flat_df = pd.DataFrame({
+            'Close': [100.0] * 30,
+            'High': [100.0] * 30,
+            'Low': [100.0] * 30,
+            'Volume': [1000000] * 30
+        }, index=pd.date_range(start='2023-01-01', periods=30))
+        indicators = analyzer._calculate_technical_indicators(flat_df)
+        # For identical prices, some indicators will be 0 or undefined
+        assert indicators['atr'] == 0.0
+        assert indicators['bb_width'] == 0.0
+        assert pd.isna(indicators['rsi']) or indicators['rsi'] == 50.0  # RSI is undefined or 50 for identical prices
+
+    def test_opportunity_score_calculation(self, analyzer):
+        """Test opportunity score calculation with various metrics."""
+        # Test perfect score
+        perfect_metrics = {
+            'momentum_score': 1.0,
+            'volume_score': 1.0,
+            'technical_score': 1.0,
+            'market_score': 1.0
+        }
+        score = analyzer._calculate_opportunity_score(perfect_metrics)
+        assert score == pytest.approx(1.0, rel=0.1)
+        
+        # Test zero score
+        zero_metrics = {
+            'momentum_score': 0.0,
+            'volume_score': 0.0,
+            'technical_score': 0.0,
+            'market_score': 0.0
+        }
+        score = analyzer._calculate_opportunity_score(zero_metrics)
+        assert score == pytest.approx(0.0, rel=0.1)
+        
+        # Test missing metrics
+        incomplete_metrics = {
+            'momentum_score': 0.5
+        }
+        score = analyzer._calculate_opportunity_score(incomplete_metrics)
+        assert 0.0 <= score <= 1.0
+        
+        # Test invalid values
+        invalid_metrics = {
+            'momentum_score': -1.0,
+            'volume_score': 2.0,
+            'technical_score': float('nan'),
+            'market_score': None
+        }
+        score = analyzer._calculate_opportunity_score(invalid_metrics)
+        assert 0.0 <= score <= 1.0
+
+    def test_save_potential_securities_edge_cases(self, analyzer, tmp_path):
+        """Test edge cases in saving potential securities."""
+        # Set temporary output file
+        analyzer.output_file = str(tmp_path / "test_output.json")
+        
+        # Test with empty list
+        result = analyzer.save_potential_securities([])
+        assert result is False
+        
+        # Test with invalid securities data
+        invalid_securities = [
+            {'Symbol': 'AAPL', 'Price': None, 'Volume': None},  # Missing required fields
+            None,  # Invalid entry
+            {'Symbol': 'GOOGL', 'Price': 'invalid', 'Volume': 'invalid'}  # Invalid price
+        ]
+        result = analyzer.save_potential_securities(invalid_securities)
+        assert result is False
+        
+        # Test with valid data but invalid output path
+        analyzer.output_file = "/invalid/path/output.json"
+        valid_securities = [{
+            'Symbol': 'AAPL',
+            'Price': 150.0,
+            'Volume': 1000000,
+            'movement_potential_score': 0.8
+        }]
+        result = analyzer.save_potential_securities(valid_securities)
+        assert result is False
+
+    def test_config_loading(self, analyzer):
+        """Test configuration loading from environment variables."""
+        # Test with valid values
+        with patch.dict('os.environ', {
+            'MIN_VOLUME': '1000000',
+            'MIN_MARKET_CAP': '100000000'
+        }):
+            analyzer.load_config()
+            assert analyzer.min_volume == 1000000
+            assert analyzer.min_market_cap == 100000000
+        
+        # Test with invalid environment variables
+        with patch.dict('os.environ', {
+            'MIN_VOLUME': 'invalid',
+            'MIN_MARKET_CAP': 'invalid'
+        }):
+            # Should use default values when environment variables are invalid
+            analyzer.load_config()
+            assert analyzer.min_volume == 500000  # Default value
+            assert analyzer.min_market_cap == 50000000  # Default value
+        
+        # Test with missing environment variables
+        with patch.dict('os.environ', clear=True):
+            analyzer.load_config()
+            assert analyzer.min_volume == 500000  # Default value
+            assert analyzer.min_market_cap == 50000000  # Default value 

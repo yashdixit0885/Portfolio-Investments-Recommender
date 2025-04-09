@@ -16,10 +16,14 @@ from src.utils.common import setup_logging
 
 def setup_environment():
     """Load .env file (if exists) and setup logging"""
-    load_dotenv() # Load environment variables from .env file, if present
-    logger = setup_logging('main') # Setup centralized logging
-    logger.info("Environment setup complete.")
-    return True
+    try:
+        load_dotenv() # Load environment variables from .env file, if present
+        logger = setup_logging('main') # Setup centralized logging
+        logger.info("Environment setup complete.")
+        return True
+    except Exception as e:
+        logging.error(f"Environment setup failed: {str(e)}")
+        return False
 
 def run_analysis_cycle():
     """Run one complete analysis cycle from Investment to Trade Analysis."""
