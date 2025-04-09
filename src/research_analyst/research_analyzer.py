@@ -5,43 +5,6 @@ This script analyzes securities that show high potential for price movement
 and assigns a Risk Score from 0 (lowest risk) to 100 (highest risk). 
 The goal is to help prioritize which securities might be safer or riskier 
 for trading.
-
-How the Risk Score is Calculated:
-
-The score is a weighted average of several factors. A higher contribution 
-from any factor increases the overall risk score:
-
-1. Volatility Risk (Weight: 30%):
-   - How much the stock's price tends to swing compared to the market (Beta) 
-     or based on its own past price changes (Standard Deviation).
-   - Higher, more unpredictable swings increase this risk component.
-
-2. Debt Risk (Weight: 25%):
-   - How much debt the company has relative to its equity.
-   - Higher debt levels can make a company more vulnerable to financial 
-     stress, increasing this risk component.
-
-3. Profitability Risk (Weight: 20%):
-   - How profitable the company is (Profit Margin).
-   - Lower profitability or losses indicate higher financial risk, 
-     increasing this risk component.
-
-4. Company Size Risk (Weight: 15%):
-   - The market value (Market Capitalization) of the company.
-   - Smaller companies are often considered riskier than large, established 
-     ones, so smaller size increases this risk component.
-
-5. Price Extreme Risk (Weight: 10%):
-   - Whether the stock price is currently at an extreme high or low 
-     compared to its recent trading range (using RSI).
-   - Extreme levels can sometimes signal higher short-term risk of a 
-     price reversal, slightly increasing this risk component.
-
-Final Score:
-- Each factor contributes based on its weight.
-- The combined result is scaled to a 0-100 score.
-- Securities are then ranked, with the lowest scores presented first, 
-  indicating potentially lower risk for the Trade Analyst's consideration.
 """
 
 import os
@@ -116,7 +79,7 @@ class ResearchAnalyzer:
             # Only fetch history if info was minimally successful (implies valid ticker)
             if yf_data['info']:
                 yf_data['history'] = self.rate_limiter.call_with_retry(get_history)
-
+            
         except Exception as e:
             # Handle cases where yfinance might raise exceptions for invalid tickers etc.
             self.logger.error(f"Error fetching yfinance data for {ticker}: {str(e)}")
@@ -145,7 +108,7 @@ class ResearchAnalyzer:
         Calculates a risk score (0-100) for a single security.
         Higher score means higher risk.
         """
-        ticker = security.get('Symbol') # Changed from 'ticker' to match InvestmentAnalyzer output
+        ticker = security.get('Symbol')
         if not ticker:
             self.logger.warning("Security missing Symbol, cannot calculate risk.")
             return 75  # Assign higher risk if symbol is missing
@@ -155,7 +118,7 @@ class ResearchAnalyzer:
         yf_info = yf_data.get('info', {})
         yf_history = yf_data.get('history', pd.DataFrame())
 
-        # --- Risk Factors Initialization (0 = lowest risk, 1 = highest risk) ---
+        # Risk Factors Initialization (0 = lowest risk, 1 = highest risk)
         risk_factors = {
             'volatility': 0.5,  # Default to medium risk
             'debt': 0.5,
@@ -164,10 +127,7 @@ class ResearchAnalyzer:
             'rsi_extreme': 0.0  # Default to low risk if not extreme
         }
 
-        # --- Calculate Risk Factors ---
-
-        # 1. Volatility (Beta from input, fallback to Std Dev from history)
-        # Use Beta directly if available and seems reasonable (e.g., > 0)
+        # Calculate Risk Factors
         beta = security.get('Beta')
         std_dev = None
         if not yf_history.empty:
@@ -175,56 +135,39 @@ class ResearchAnalyzer:
             std_dev = vol_metrics.get('std_dev')
 
         if beta is not None and beta > 0:
-            # Normalize beta: e.g., 0.5 -> 0, 1.0 -> 0.25, 1.5 -> 0.5, 2.0 -> 0.75, 2.5+ -> 1.0
             risk_factors['volatility'] = min(1.0, max(0.0, (beta - 0.5) / 2.0))
             self.logger.debug(f"{ticker}: Using Beta {beta:.2f} -> Volatility Risk {risk_factors['volatility']:.2f}")
         elif std_dev is not None and std_dev > 0:
-            # Normalize std dev: e.g., 15% -> 0, 30% -> 0.25, 45% -> 0.5, 60% -> 0.75, 75%+ -> 1.0
             risk_factors['volatility'] = min(1.0, max(0.0, (std_dev - 0.15) / 0.60))
             self.logger.debug(f"{ticker}: Using Std Dev {std_dev:.2f} -> Volatility Risk {risk_factors['volatility']:.2f}")
-        # Else: Keep default 0.5
 
-        # 2. Debt (Debt-to-Equity from yfinance info)
+        # Debt Risk
         debt_to_equity = yf_info.get('debtToEquity')
         if debt_to_equity is not None:
-            # yfinance D/E is typically percentage, like 110. Need to divide by 100.
-            # Normalize D/E ratio: e.g., 0 -> 0, 1.0 -> 0.5, 2.0+ -> 1.0
             risk_factors['debt'] = min(1.0, max(0.0, (debt_to_equity / 100) / 2.0))
             self.logger.debug(f"{ticker}: D/E {debt_to_equity:.1f} -> Debt Risk {risk_factors['debt']:.2f}")
-        # Else: Keep default 0.5
 
-        # 3. Profitability (Profit Margin from yfinance info)
+        # Profitability Risk
         profit_margin = yf_info.get('profitMargins')
         if profit_margin is not None:
-            # Normalize Profit Margin (lower margin = higher risk):
-            # e.g., 20%+ -> 0, 10% -> 0.25, 0% -> 0.5, -10% -> 0.75, -20%- -> 1.0
             risk_factors['profitability'] = min(1.0, max(0.0, (0.20 - profit_margin) / 0.40))
             self.logger.debug(f"{ticker}: Margin {profit_margin:.2%} -> Profit Risk {risk_factors['profitability']:.2f}")
-        # Else: Keep default 0.5
 
-        # 4. Size (Market Cap from input data)
+        # Size Risk
         market_cap = security.get('Market Cap')
         if market_cap is not None and market_cap > 0:
-            # Normalize Market Cap (smaller cap = higher risk):
-            # Use logarithmic scale for better distribution
-            # e.g., <$500M (High=1.0), $500M-$2B (Med-High=0.75), $2B-$10B (Medium=0.5), $10B-$200B (Med-Low=0.25), >$200B (Low=0.0)
             log_cap = np.log10(market_cap)
-            # Scale roughly from log10(500M)=8.7 to log10(200B)=11.3
             risk_factors['size'] = min(1.0, max(0.0, (11.3 - log_cap) / (11.3 - 8.7)))
             self.logger.debug(f"{ticker}: Cap {market_cap:,.0f} (log={log_cap:.1f}) -> Size Risk {risk_factors['size']:.2f}")
-        # Else: Keep default 0.5
 
-        # 5. RSI Extremes (RSI from input data - assume 0-1 range from Inv. Analyzer)
-        rsi_input = security.get('rsi') # Assuming this is 0-1
+        # RSI Extreme Risk
+        rsi_input = security.get('rsi')
         if rsi_input is not None:
-            # Normalize RSI Extremes (closer to 0 or 1 = higher risk)
-            # e.g., 0.5 -> 0, 0.3/0.7 -> 0.5, 0.1/0.9 -> 1.0
-            rsi_risk = abs(rsi_input - 0.5) / 0.4 # Distance from center / max distance considered extreme
+            rsi_risk = abs(rsi_input - 0.5) / 0.4
             risk_factors['rsi_extreme'] = min(1.0, max(0.0, rsi_risk))
             self.logger.debug(f"{ticker}: RSI {rsi_input:.2f} -> RSI Extreme Risk {risk_factors['rsi_extreme']:.2f}")
-        # Else: Keep default 0.0 (no extreme risk)
 
-        # --- Combine Factors with Weights ---
+        # Combine Factors with Weights
         weights = {
             'volatility': 0.30,
             'debt': 0.25,
@@ -234,54 +177,43 @@ class ResearchAnalyzer:
         }
 
         total_risk_score_normalized = sum(risk_factors[factor] * weights[factor] for factor in weights)
-
-        # Scale to 0-100
         final_risk_score = int(round(total_risk_score_normalized * 100))
 
         self.logger.info(f"Calculated risk score for {ticker}: {final_risk_score}")
         return final_risk_score
 
-
     def run_risk_analysis(self) -> bool:
         """Main entry point to load high-potential securities, calculate risk, rank, and save."""
         self.logger.info("Starting Research Analyzer: Calculating risk scores.")
         
-        # Load securities identified by InvestmentAnalyzer
         if not os.path.exists(self.input_file):
             self.logger.error(f"Input file not found: {self.input_file}")
             return False
-            
+                
         potential_securities = load_from_json(self.input_file)
         if not potential_securities:
             self.logger.warning(f"No securities loaded from {self.input_file}. Nothing to analyze.")
             return False
-            
+                
         self.logger.info(f"Loaded {len(potential_securities)} high-potential securities for risk analysis.")
 
         risk_scored_results = []
         for security in potential_securities:
-            # Make a copy to avoid modifying the original dict if needed later
-            security_data = security.copy() # Use a different name to avoid confusion
+            security_data = security.copy()
             try:
                 risk_score = self._calculate_risk_score(security_data)
                 security_data['risk_score'] = risk_score
                 risk_scored_results.append(security_data)
             except Exception as e:
                 self.logger.error(f"Failed to calculate risk score for {security_data.get('Symbol', 'Unknown')}: {str(e)}", exc_info=True)
-                # Optionally add with a default high score or skip
-                # security_data['risk_score'] = 99
-                # risk_scored_results.append(security_data)
 
-        # Sort by risk score (ascending)
-        risk_scored_results.sort(key=lambda x: x.get('risk_score', 999))  # Put errors/missing scores last
+        risk_scored_results.sort(key=lambda x: x.get('risk_score', 999))
 
-        # Save the results
         if not risk_scored_results:
             self.logger.warning("No securities were successfully risk-scored.")
             return False
 
         try:
-            # Add timestamp to the saved data
             output_data = {
                 "analysis_timestamp": get_current_time().isoformat(),
                 "risk_scored_securities": risk_scored_results
@@ -298,17 +230,7 @@ class ResearchAnalyzer:
             return False
 
 
-# Example Usage
 if __name__ == "__main__":
-    # Use the setup_logging from common utils if it exists and is preferred
-    # Otherwise, basicConfig is fine for standalone testing
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     analyzer = ResearchAnalyzer()
-    analyzer.run_risk_analysis()
-
-# --- Methods Removed/Replaced Summary ---
-# All methods related to recommendations, confidence, rationale, time horizon, 
-# position sizing, detailed qualitative analysis, news processing, etc., have been removed.
-# Core functionality is now loading data, fetching supplemental yfinance data (info/history) 
-# via a rate-limited cache, calculating a risk score based on volatility, debt, profitability, size, 
-# and RSI extremes, sorting by risk, and saving the results.
+    analyzer.run_risk_analysis() 

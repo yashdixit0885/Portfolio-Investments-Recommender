@@ -58,23 +58,18 @@ class InvestmentAnalyzer:
         self.min_volume = int(os.getenv('MIN_VOLUME', '500000')) 
         self.min_market_cap = float(os.getenv('MIN_MARKET_CAP', '50000000'))
         
-    def _clean_numeric(self, x):
-        """Cleans and converts input to a float, handling N/A, percentages, and commas."""
-        if pd.isna(x) or x == 'N/A':
-            return np.nan # Use NaN for missing values initially
-        if isinstance(x, (int, float)):
-            return float(x)
-        # Remove any spaces and handle percentage signs
-        x = str(x).strip().replace(' ', '')
-        # Remove percentage sign and handle plus signs
-        x = x.replace('%', '').replace('+', '')
-        # Remove commas from numbers
-        x = x.replace(',', '')
+    def _clean_numeric(self, value):
+        """Clean and convert numeric values from strings to floats."""
+        if pd.isna(value) or value is None or value == '':
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        # Remove any non-numeric characters except decimal point and minus sign
+        cleaned = ''.join(c for c in str(value) if c.isdigit() or c in '.-')
         try:
-            return float(x)
+            return float(cleaned) if cleaned else 0.0
         except ValueError:
-            self.logger.debug(f"Could not convert '{x}' to float, returning NaN")
-            return np.nan
+            return 0.0
 
     def load_and_prepare_securities(self) -> pd.DataFrame:
         """Loads securities data from the CSV file, cleans it, and calculates necessary metrics."""
@@ -144,97 +139,103 @@ class InvestmentAnalyzer:
             self.logger.error(f"Error loading and preparing securities data: {str(e)}", exc_info=True)
             return pd.DataFrame()
 
-    def _calculate_price_movement_potential(self, row: pd.Series) -> float:
-        """Calculate a score indicating the potential for significant price movement (magnitude)."""
+    def _calculate_price_movement_potential(self, securities_data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate the price movement potential for each security based on technical indicators.
+        
+        Args:
+            securities_data (pd.DataFrame): DataFrame containing securities data with RSI, MACD, and volume metrics.
+        
+        Returns:
+            pd.DataFrame: DataFrame with added price_movement_potential column.
+        """
         try:
-            # Normalize and weight factors contributing to potential movement
+            # Create a copy to avoid modifying the original DataFrame
+            result_df = securities_data.copy()
             
-            # 1. Volatility/Beta (25%): Higher beta suggests higher potential volatility
-            beta = row.get('Beta', 1.0) # Default to 1.0 if missing
-            beta_score = min(1.0, max(0, (beta / 2.0))) # Normalize roughly (e.g., beta 2.0 = max score)
-            
-            # 2. Price Momentum (Absolute) (35%): Larger distance from MAs indicates potential
-            abs_momentum_50d = abs(row.get('price_momentum_50d', 0))
-            abs_momentum_200d = abs(row.get('price_momentum_200d', 0))
-            # Normalize (e.g., 20% move = max score)
-            norm_momentum_50d = min(1.0, abs_momentum_50d / 0.20) 
-            norm_momentum_200d = min(1.0, abs_momentum_200d / 0.20)
-            momentum_score = (norm_momentum_50d * 0.6) + (norm_momentum_200d * 0.4)
-            
-            # 3. Volume Surge (Positive) (25%): High volume increases confidence in moves
-            vol_change_50d = max(0, row.get('volume_change_50d', 0)) # Only consider positive change
-            vol_change_200d = max(0, row.get('volume_change_200d', 0))
-            # Normalize (e.g., 2x average volume = max score)
-            norm_vol_50d = min(1.0, vol_change_50d / 1.0) # 1.0 = 100% increase = 2x avg vol
-            norm_vol_200d = min(1.0, vol_change_200d / 1.0)
-            volume_score = (norm_vol_50d * 0.6) + (norm_vol_200d * 0.4)
-            
-            # 4. RSI Extremes (15%): Further from 50 indicates more potential for reversion/trend
-            rsi = row.get('rsi', 0.5) * 100 # Assuming RSI was stored as 0-1
-            rsi_distance = abs(rsi - 50)
-            rsi_score = min(1.0, rsi_distance / 30) # Normalize (e.g., RSI 20 or 80 = max score)
-
-            # Calculate final score
-            final_score = (
-                beta_score * 0.25 +
-                momentum_score * 0.35 +
-                volume_score * 0.25 +
-                rsi_score * 0.15
+            # Calculate RSI potential (higher RSI indicates overbought, lower indicates oversold)
+            result_df['rsi_potential'] = result_df['rsi'].apply(lambda x: 
+                1.0 if x <= 30 else  # Strong oversold signal
+                0.8 if x <= 40 else  # Moderate oversold signal
+                0.2 if x >= 70 else  # Strong overbought signal
+                0.4 if x >= 60 else  # Moderate overbought signal
+                0.5  # Neutral
             )
             
-            return round(final_score, 4)
+            # Calculate MACD potential based on MACD crossing signal line
+            result_df['macd_potential'] = (
+                (result_df['14D MACD'] - result_df['14D MACD_Signal']).apply(lambda x:
+                    1.0 if x > 2 else  # Strong bullish signal
+                    0.8 if x > 0 else  # Moderate bullish signal
+                    0.2 if x < -2 else  # Strong bearish signal
+                    0.4 if x < 0 else  # Moderate bearish signal
+                    0.5  # Neutral
+                )
+            )
+            
+            # Calculate volume potential based on volume changes
+            result_df['volume_potential'] = (
+                (result_df['Volume'] / result_df['50D Avg Vol']).apply(lambda x:
+                    1.0 if x > 2.0 else  # Very high volume
+                    0.8 if x > 1.5 else  # High volume
+                    0.6 if x > 1.2 else  # Moderate volume
+                    0.4 if x > 0.8 else  # Low volume
+                    0.2  # Very low volume
+                )
+            )
+            
+            # Calculate weighted average of all potentials
+            weights = {
+                'rsi_potential': 0.4,
+                'macd_potential': 0.4,
+                'volume_potential': 0.2
+            }
+            
+            result_df['price_movement_potential'] = (
+                result_df['rsi_potential'] * weights['rsi_potential'] +
+                result_df['macd_potential'] * weights['macd_potential'] +
+                result_df['volume_potential'] * weights['volume_potential']
+            )
+            
+            # Drop intermediate columns
+            result_df = result_df.drop(['rsi_potential', 'macd_potential', 'volume_potential'], axis=1)
+            
+            return result_df
             
         except Exception as e:
-            self.logger.warning(f"Error calculating movement potential for {row.get('Symbol', 'Unknown')}: {str(e)}")
-            return 0.0
+            self.logger.error(f"Error calculating price movement potential: {str(e)}")
+            # Return original DataFrame with a default price_movement_potential column
+            securities_data['price_movement_potential'] = 0.5  # Neutral score
+            return securities_data
     
-    def identify_potential_movers(self) -> List[Dict]:
-        """Loads data, calculates movement potential, selects top 10%, and returns them."""
-        df = self.load_and_prepare_securities()
+    def identify_potential_movers(self) -> pd.DataFrame:
+        """
+        Identify potential movers based on price movement potential and other metrics.
         
-        if df.empty:
-            self.logger.error("Failed to load or prepare securities data. Cannot identify potential movers.")
-            return []
+        Returns:
+            pd.DataFrame: DataFrame containing potential movers with their scores and metrics.
+        """
+        try:
+            # Load and prepare securities data
+            df = self.load_and_prepare_securities()
             
-        # Calculate potential score for each security
-        df['movement_potential_score'] = df.apply(self._calculate_price_movement_potential, axis=1)
-        
-        # Sort by score
-        df_sorted = df.sort_values(by='movement_potential_score', ascending=False)
-        
-        # Determine number to select (at least 10%)
-        total_securities = len(df_sorted)
-        num_to_select = max(1, int(total_securities * 0.10)) 
-        
-        self.logger.info(f"Calculated movement potential for {total_securities} securities.")
-        self.logger.info(f"Selecting top {num_to_select} securities (>= 10%) for further analysis.")
-        
-        # Select top N
-        top_securities_df = df_sorted.head(num_to_select)
-        
-        # Convert to list of dictionaries for saving/passing on
-        # Select relevant columns to pass to the Research Analyst
-        columns_to_keep = [
-            'Symbol', 'Name', 'Last', 'Industry', 'Sector', 'Market Cap', 'Volume',
-            'price_momentum_50d', 'price_momentum_200d', 
-            'volume_change_50d', 'volume_change_200d',
-            'rsi', 'Beta', 'movement_potential_score'
-        ]
-        # Filter columns that actually exist in the dataframe
-        existing_columns_to_keep = [col for col in columns_to_keep if col in top_securities_df.columns]
-        
-        potential_movers = top_securities_df[existing_columns_to_keep].to_dict('records')
-        
-        # Add timestamp
-        timestamp = get_current_time().isoformat()
-        for mover in potential_movers:
-            mover['identified_at'] = timestamp
-            # Convert NaN to None for JSON compatibility
-            for key, value in mover.items():
-                 if pd.isna(value):
-                     mover[key] = None
-
-        return potential_movers
+            # Calculate price movement potential for all securities
+            df = self._calculate_price_movement_potential(df)
+            
+            # Filter for securities with high movement potential
+            high_potential = df[df['price_movement_potential'] > 0.7].copy()
+            
+            # Sort by movement potential in descending order
+            high_potential = high_potential.sort_values('price_movement_potential', ascending=False)
+            
+            # Add additional analysis if needed
+            high_potential['analysis_timestamp'] = pd.Timestamp.now()
+            
+            return high_potential
+            
+        except Exception as e:
+            self.logger.error(f"Error in identify_potential_movers: {str(e)}")
+            return pd.DataFrame()  # Return empty DataFrame on error
 
     def save_potential_securities(self, securities: List[Dict[str, Any]]) -> bool:
         """Saves the list of high-potential securities to a JSON file."""
@@ -257,11 +258,11 @@ class InvestmentAnalyzer:
         self.logger.info("Starting Investment Analyzer: Identifying high price movement potential securities.")
         potential_movers = self.identify_potential_movers()
         
-        if not potential_movers:
+        if potential_movers.empty:
              self.logger.warning("Investment Analysis did not identify any securities.")
              return False
              
-        success = self.save_potential_securities(potential_movers)
+        success = self.save_potential_securities(potential_movers.to_dict('records'))
         
         if success:
             self.logger.info("Investment Analyzer finished successfully.")
@@ -269,6 +270,55 @@ class InvestmentAnalyzer:
             self.logger.error("Investment Analyzer finished with errors during saving.")
             
         return success
+
+    def _calculate_opportunity_score(self, metrics: Dict) -> float:
+        """Calculate an opportunity score based on various metrics."""
+        try:
+            # Initialize component scores
+            momentum_score = 0.0
+            volume_score = 0.0
+            technical_score = 0.0
+            fundamental_score = 0.0
+            
+            # Calculate momentum score (30%)
+            if 'price_momentum_50d' in metrics and 'price_momentum_200d' in metrics:
+                momentum_50d = metrics['price_momentum_50d']
+                momentum_200d = metrics['price_momentum_200d']
+                momentum_score = (momentum_50d * 0.6 + momentum_200d * 0.4) * 0.3
+            
+            # Calculate volume score (20%)
+            if 'volume_change_50d' in metrics and 'volume_change_200d' in metrics:
+                volume_50d = metrics['volume_change_50d']
+                volume_200d = metrics['volume_change_200d']
+                volume_score = (volume_50d * 0.6 + volume_200d * 0.4) * 0.2
+            
+            # Calculate technical score (25%)
+            if 'rsi' in metrics and 'macd' in metrics:
+                rsi = metrics['rsi']
+                macd = metrics['macd']
+                technical_score = (
+                    (1 - abs(rsi - 50) / 50) * 0.5 +  # RSI component
+                    (1 if macd > 0 else 0) * 0.5      # MACD component
+                ) * 0.25
+            
+            # Calculate fundamental score (25%)
+            if 'pe_ratio' in metrics and 'price_to_book' in metrics:
+                pe = metrics['pe_ratio']
+                pb = metrics['price_to_book']
+                fundamental_score = (
+                    (1 / (1 + abs(pe - 15) / 15)) * 0.5 +  # PE component
+                    (1 / (1 + abs(pb - 2) / 2)) * 0.5      # PB component
+                ) * 0.25
+            
+            # Calculate final score
+            final_score = momentum_score + volume_score + technical_score + fundamental_score
+            
+            # Normalize to 0-1 range
+            return max(0.0, min(1.0, final_score))
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating opportunity score: {str(e)}")
+            return 0.0
 
 # Example Usage (Optional - useful for testing this module directly)
 if __name__ == "__main__":

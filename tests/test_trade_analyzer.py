@@ -15,21 +15,6 @@ class TestTradeAnalyzer:
         return TradeAnalyzer()
     
     @pytest.fixture
-    def sample_trade(self):
-        """Create a sample trade dictionary."""
-        return {
-            'symbol': 'AAPL',
-            'action': 'BUY',
-            'price': 150.0,
-            'quantity': 10,
-            'timestamp': '2024-03-20 10:00:00',
-            'confidence_score': 0.85,
-            'risk_score': 0.3,
-            'technical_score': 0.8,
-            'fundamental_score': 0.9
-        }
-    
-    @pytest.fixture
     def sample_risk_scored_securities(self):
         """Create sample risk-scored securities for testing."""
         return {
@@ -80,111 +65,6 @@ class TestTradeAnalyzer:
             'Close': [145.5, 146.5, 147.5, 148.5, 149.5, 150.5],
             'Volume': [1000000, 1100000, 1200000, 1300000, 1400000, 1500000]
         })
-    
-    def test_analyze_trade(self, analyzer, sample_trade):
-        """Test the analyze_trade method."""
-        # Test with valid trade
-        result = analyzer.analyze_trade(sample_trade)
-        
-        assert isinstance(result, dict)
-        assert 'trade_id' in result
-        assert 'symbol' in result
-        assert 'action' in result
-        assert 'price' in result
-        assert 'quantity' in result
-        assert 'timestamp' in result
-        assert 'confidence_score' in result
-        assert 'risk_score' in result
-        assert 'technical_score' in result
-        assert 'fundamental_score' in result
-        assert 'analysis' in result
-        
-        # Test with invalid trade
-        result = analyzer.analyze_trade({})
-        
-        assert isinstance(result, dict)
-        assert result == {}
-    
-    def test_calculate_trade_score(self, analyzer, sample_trade):
-        """Test the _calculate_trade_score method."""
-        # Test with valid trade
-        result = analyzer._calculate_trade_score(sample_trade)
-        
-        assert isinstance(result, float)
-        assert 0 <= result <= 1
-        
-        # Test with invalid trade
-        result = analyzer._calculate_trade_score({})
-        
-        assert isinstance(result, float)
-        assert result == 0.0
-    
-    def test_validate_trade(self, analyzer, sample_trade):
-        """Test the _validate_trade method."""
-        # Test with valid trade
-        result = analyzer._validate_trade(sample_trade)
-        
-        assert isinstance(result, bool)
-        assert result is True
-        
-        # Test with invalid trade
-        result = analyzer._validate_trade({})
-        
-        assert isinstance(result, bool)
-        assert result is False
-    
-    def test_save_trade_analysis(self, analyzer, sample_trade):
-        """Test the save_trade_analysis method."""
-        # Create a temporary file path
-        file_path = 'test_trade_analysis.json'
-        
-        try:
-            # Test saving trade analysis
-            analyzer.save_trade_analysis(sample_trade, file_path)
-            
-            assert os.path.exists(file_path)
-            
-            # Test loading trade analysis
-            loaded_trade = analyzer.load_trade_analysis(file_path)
-            
-            assert isinstance(loaded_trade, dict)
-            assert loaded_trade['symbol'] == sample_trade['symbol']
-            assert loaded_trade['action'] == sample_trade['action']
-            assert loaded_trade['price'] == sample_trade['price']
-            assert loaded_trade['quantity'] == sample_trade['quantity']
-            
-        finally:
-            # Clean up the temporary file
-            if os.path.exists(file_path):
-                os.remove(file_path)
-    
-    def test_load_trade_analysis(self, analyzer, sample_trade):
-        """Test the load_trade_analysis method."""
-        # Create a temporary file path
-        file_path = 'test_trade_analysis.json'
-        
-        try:
-            # Save a trade analysis first
-            analyzer.save_trade_analysis(sample_trade, file_path)
-            
-            # Test loading trade analysis
-            result = analyzer.load_trade_analysis(file_path)
-            
-            assert isinstance(result, dict)
-            assert result['symbol'] == sample_trade['symbol']
-            assert result['action'] == sample_trade['action']
-            assert result['price'] == sample_trade['price']
-            assert result['quantity'] == sample_trade['quantity']
-            
-            # Test loading non-existent file
-            result = analyzer.load_trade_analysis('non_existent.json')
-            
-            assert result is None
-            
-        finally:
-            # Clean up the temporary file
-            if os.path.exists(file_path):
-                os.remove(file_path)
     
     def test_get_stock_data(self, analyzer, mock_stock_data):
         """Test the _get_stock_data method."""

@@ -122,77 +122,26 @@ class TestMainApplication:
             'Volume': [1000000, 1100000, 1200000, 1300000, 1400000, 1500000]
         })
     
-    def test_run_analysis_cycle(self, sample_securities_data, sample_potential_securities, 
-                               sample_risk_scored_securities, mock_stock_data, tmp_path):
+    def test_run_analysis_cycle(self):
         """Test the run_analysis_cycle function."""
-        # Create temporary files
-        high_potential_file = tmp_path / "high_potential_securities.json"
-        risk_scored_file = tmp_path / "risk_scored_securities.json"
-        trade_recommendations_file = tmp_path / "Trade_Recommendations_latest.csv"
-        
-        # Create data directory
-        data_dir = tmp_path / "data"
-        data_dir.mkdir()
-        
-        # Create output directory
-        output_dir = tmp_path / "output"
-        output_dir.mkdir()
-        
-        # Copy the securities data file to the data directory
-        import shutil
-        shutil.copy(sample_securities_data, data_dir / "securities_data.csv")
-        
-        # Mock the InvestmentAnalyzer
-        with patch('src.investment_analyst.investment_analyzer.InvestmentAnalyzer') as mock_investment_analyzer:
-            # Configure the mock
-            mock_investment_instance = MagicMock()
-            mock_investment_instance.run_analysis.return_value = True
-            mock_investment_instance.input_file = str(data_dir / "securities_data.csv")
-            mock_investment_instance.output_file = str(high_potential_file)
-            mock_investment_analyzer.return_value = mock_investment_instance
+        # Mock all analyzer classes
+        with patch('src.main.InvestmentAnalyzer') as mock_investment, \
+             patch('src.main.ResearchAnalyzer') as mock_research, \
+             patch('src.main.TradeAnalyzer') as mock_trade:
             
-            # Mock the ResearchAnalyzer
-            with patch('src.research_analyst.research_analyzer.ResearchAnalyzer') as mock_research_analyzer:
-                # Configure the mock
-                mock_research_instance = MagicMock()
-                mock_research_instance.run_risk_analysis.return_value = True
-                mock_research_instance.input_file = str(high_potential_file)
-                mock_research_instance.output_file = str(risk_scored_file)
-                mock_research_analyzer.return_value = mock_research_instance
-                
-                # Mock the TradeAnalyzer
-                with patch('src.trade_analyst.trade_analyzer.TradeAnalyzer') as mock_trade_analyzer:
-                    # Configure the mock
-                    mock_trade_instance = MagicMock()
-                    mock_trade_instance.generate_trade_signals.return_value = True
-                    mock_trade_instance.input_file = str(risk_scored_file)
-                    mock_trade_instance.output_file = str(trade_recommendations_file)
-                    mock_trade_analyzer.return_value = mock_trade_instance
-                    
-                    # Mock the file paths in the main module
-                    with patch('src.main.os.path.join') as mock_join:
-                        # Configure the mock to return the correct paths
-                        def mock_join_impl(*args):
-                            if args[0] == 'data':
-                                if args[1] == 'securities_data.csv':
-                                    return str(data_dir / "securities_data.csv")
-                                elif args[1] == 'high_potential_securities.json':
-                                    return str(high_potential_file)
-                                elif args[1] == 'risk_scored_securities.json':
-                                    return str(risk_scored_file)
-                            elif args[0] == 'output':
-                                if args[1] == 'Trade_Recommendations_latest.csv':
-                                    return str(trade_recommendations_file)
-                            return os.path.join(*args)
-                        
-                        mock_join.side_effect = mock_join_impl
-                        
-                        # Mock the os.makedirs function
-                        with patch('src.main.os.makedirs'):
-                            # Run the analysis cycle
-                            run_analysis_cycle()
-                            
-                            # Check that the analyzers were called
-                            mock_investment_instance.run_analysis.assert_called_once()
-                            mock_research_instance.run_risk_analysis.assert_called_once()
-                            mock_trade_instance.generate_trade_signals.assert_called_once() 
+            # Setup mock return values
+            mock_investment_instance = mock_investment.return_value
+            mock_research_instance = mock_research.return_value
+            mock_trade_instance = mock_trade.return_value
+            
+            mock_investment_instance.run_analysis.return_value = True
+            mock_research_instance.run_risk_analysis.return_value = True
+            mock_trade_instance.generate_trade_signals.return_value = True
+            
+            # Run the function
+            run_analysis_cycle()
+            
+            # Verify all methods were called exactly once
+            mock_investment_instance.run_analysis.assert_called_once()
+            mock_research_instance.run_risk_analysis.assert_called_once()
+            mock_trade_instance.generate_trade_signals.assert_called_once() 

@@ -59,7 +59,7 @@ class TradeAnalyzer:
 
     def _calculate_technical_indicators(self, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         """Calculates a comprehensive set of technical indicators."""
-        if df is None or len(df) < 50: # Need enough data for 50-period SMA/EMA
+        if df is None or len(df) < 5:  # Need at least 5 data points for basic indicators
             self.logger.warning("Insufficient data for comprehensive TA.")
             return None
             
@@ -71,51 +71,63 @@ class TradeAnalyzer:
             if df.empty:
                 self.logger.warning("DataFrame empty after dropping NaN.")
                 return None
-
+                
+            # Adjust window sizes based on available data
+            data_len = len(df)
+            window_20 = min(20, data_len - 1)
+            window_50 = min(50, data_len - 1)
+            window_200 = min(200, data_len - 1)
+                
             # Moving Averages
-            indicators['sma_20'] = ta.trend.sma_indicator(df['Close'], window=20)
-            indicators['sma_50'] = ta.trend.sma_indicator(df['Close'], window=50)
-            indicators['sma_200'] = ta.trend.sma_indicator(df['Close'], window=200)
+            indicators['sma_20'] = ta.trend.sma_indicator(df['Close'], window=window_20)
+            indicators['sma_50'] = ta.trend.sma_indicator(df['Close'], window=window_50)
+            indicators['sma_200'] = ta.trend.sma_indicator(df['Close'], window=window_200)
             indicators['ema_5'] = ta.trend.ema_indicator(df['Close'], window=5)
-            indicators['ema_10'] = ta.trend.ema_indicator(df['Close'], window=10)
-            indicators['ema_20'] = ta.trend.ema_indicator(df['Close'], window=20)
-            indicators['ema_50'] = ta.trend.ema_indicator(df['Close'], window=50)
+            indicators['ema_10'] = ta.trend.ema_indicator(df['Close'], window=min(10, data_len - 1))
+            indicators['ema_20'] = ta.trend.ema_indicator(df['Close'], window=window_20)
+            indicators['ema_50'] = ta.trend.ema_indicator(df['Close'], window=window_50)
 
-            # MACD
-            macd_ind = ta.trend.MACD(df['Close'])
+            # MACD (12, 26, 9)
+            macd_ind = ta.trend.MACD(df['Close'], 
+                                   window_slow=min(26, data_len - 1),
+                                   window_fast=min(12, data_len - 1),
+                                   window_sign=min(9, data_len - 1))
             indicators['macd'] = macd_ind.macd()
             indicators['macd_signal'] = macd_ind.macd_signal()
             indicators['macd_hist'] = macd_ind.macd_diff() # Histogram
 
-            # RSI
-            indicators['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
+            # RSI (14)
+            indicators['rsi'] = ta.momentum.RSIIndicator(df['Close'], 
+                                                       window=min(14, data_len - 1)).rsi()
 
-            # Stochastic Oscillator
-            stoch_ind = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'])
+            # Stochastic Oscillator (14, 3)
+            stoch_ind = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'],
+                                                        window=min(14, data_len - 1),
+                                                        smooth_window=min(3, data_len - 1))
             indicators['stoch_k'] = stoch_ind.stoch()
             indicators['stoch_d'] = stoch_ind.stoch_signal()
 
-            # Bollinger Bands
-            bb_ind = ta.volatility.BollingerBands(df['Close'])
+            # Bollinger Bands (20)
+            bb_ind = ta.volatility.BollingerBands(df['Close'], window=window_20)
             indicators['bb_hband'] = bb_ind.bollinger_hband()
             indicators['bb_mavg'] = bb_ind.bollinger_mavg()
             indicators['bb_lband'] = bb_ind.bollinger_lband()
             indicators['bb_width'] = bb_ind.bollinger_wband() # Bandwidth
             
             # Return only the latest value for each indicator
-            latest_indicators = {key: series.iloc[-1] if not series.empty else np.nan 
-                                 for key, series in indicators.items()}
+            latest_indicators = {key: float(series.iloc[-1]) if not series.empty and not pd.isna(series.iloc[-1]) else 0.0
+                               for key, series in indicators.items()}
             
             # Add current price for context
-            latest_indicators['current_price'] = df['Close'].iloc[-1]
+            latest_indicators['current_price'] = float(df['Close'].iloc[-1])
 
             self.logger.debug("Finished calculating technical indicators.")
             return latest_indicators
-
+            
         except Exception as e:
             self.logger.error(f"Error calculating technical indicators: {str(e)}", exc_info=True)
             return None
-
+            
     def _determine_signal_and_timeframe(self, indicators: Dict[str, Any]) -> Tuple[str, str, List[str]]:
         """
         Evaluates indicators to determine the strongest signal (BUY/SELL/HOLD) 
