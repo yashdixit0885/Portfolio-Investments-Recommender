@@ -152,10 +152,12 @@ def test_save_to_json(tmp_path):
     
     # Test save with invalid data
     invalid_data = {'key': object()}  # Non-serializable object
-    assert save_to_json(invalid_data, str(test_file)) is False
+    with pytest.raises(TypeError):
+        save_to_json(invalid_data, str(test_file))
     
     # Test save with invalid path
-    assert save_to_json(test_data, '/invalid/path/test.json') is False
+    with pytest.raises(OSError):
+        save_to_json(test_data, '/invalid/path/test.json')
 
 def test_load_from_json(tmp_path):
     """Test JSON file loading functionality."""

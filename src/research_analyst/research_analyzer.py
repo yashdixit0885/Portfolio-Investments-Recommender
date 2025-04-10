@@ -97,29 +97,35 @@ class ResearchAnalyzer:
         """
         yf_data = {'info': {}, 'history': pd.DataFrame()}
         
+        # Check cache first
+        cache_key = f"{ticker}_data"
+        if cache_key in self.data_cache:
+            self.logger.debug(f"Cache hit for {ticker}")
+            return self.data_cache[cache_key]
+        
         try:
-            # Check cache first
-            cache_key = f"{ticker}_data"
-            if cache_key in self.data_cache:
-                self.logger.debug(f"Cache hit for {ticker}")
-                return self.data_cache[cache_key]
-            
             # Fetch data from yfinance
             stock = yf.Ticker(ticker)
             
+            # Fetch info data
+            info_data = {}
             try:
                 info_data = stock.info
-                if info_data:
-                    yf_data['info'] = info_data
             except Exception as e:
                 self.logger.warning(f"Error fetching info data for {ticker}: {str(e)}")
             
+            # Fetch history data
+            hist_data = pd.DataFrame()
             try:
                 hist_data = stock.history(period='1y')
-                if not hist_data.empty:
-                    yf_data['history'] = hist_data
             except Exception as e:
                 self.logger.warning(f"Error fetching historical data for {ticker}: {str(e)}")
+            
+            # Update yf_data only if we have valid data
+            if info_data:
+                yf_data['info'] = info_data
+            if not hist_data.empty:
+                yf_data['history'] = hist_data
             
             # Cache the data
             self.data_cache[cache_key] = yf_data
@@ -198,207 +204,132 @@ class ResearchAnalyzer:
         # Fetch required data from yfinance
         yf_data = self._fetch_yf_data(ticker)
         yf_info = yf_data.get('info', {})
-        yf_history = yf_data.get('history', pd.DataFrame())
+        history = yf_data.get('history', pd.DataFrame())
 
-        # Risk Factors Initialization (0 = lowest risk, 1 = highest risk)
+        # Calculate volatility metrics
+        volatility_metrics = self._calculate_volatility_metrics(history)
+
+        # Initialize risk factors
         risk_factors = {
-            'volatility': 0.5,  # Default to medium risk
-            'debt': 0.5,
-            'profitability': 0.5,
-            'size': 0.5,
-            'rsi_extreme': 0.0,
-            'liquidity': 0.5,
-            'sector': 0.5,
-            'earnings_quality': 0.5,
-            'institutional': 0.5,
-            'short_interest': 0.0,
-            'market_correlation': 0.5,  # New factor
-            'trend': 0.5  # New factor
+            'volatility_risk': 0.0,
+            'market_risk': 0.0,
+            'financial_risk': 0.0,
+            'sector_risk': 0.0,
+            'technical_risk': 0.0
         }
 
-        # Calculate Risk Factors
-        # 1. Enhanced Volatility Risk
-        vol_metrics = self._calculate_volatility_metrics(yf_history)
-        beta = security.get('Beta')
-        
-        if beta is not None and beta > 0:
-            risk_factors['volatility'] = min(1.0, max(0.0, (beta - 0.5) / 2.0))
-        elif vol_metrics['std_dev'] is not None:
-            # Consider both standard deviation and VaR/CVaR
-            std_dev_risk = min(1.0, max(0.0, (vol_metrics['std_dev'] - 0.15) / 0.60))
-            var_risk = min(1.0, max(0.0, vol_metrics['var_95'] / 0.05)) if vol_metrics['var_95'] else 0.5
-            cvar_risk = min(1.0, max(0.0, vol_metrics['cvar_95'] / 0.08)) if vol_metrics['cvar_95'] else 0.5
-            
-            risk_factors['volatility'] = (std_dev_risk * 0.4 + var_risk * 0.3 + cvar_risk * 0.3)
-            
-        # Add volatility trend impact
-        if vol_metrics['volatility_trend'] is not None and vol_metrics['volatility_trend'] > 0:
-            risk_factors['volatility'] = min(1.0, risk_factors['volatility'] + vol_metrics['volatility_trend'])
+        # Base risk for missing data
+        missing_data_penalty = 0
+        required_fields = ['Beta', 'Market Cap', 'Volume', 'rsi', 'Industry']
+        for field in required_fields:
+            if field not in security or not security[field]:
+                missing_data_penalty += 10
 
-        # 2. Market Correlation Risk
-        try:
-            market_data = self._fetch_yf_data('^GSPC')['history']  # S&P 500
-            if not market_data.empty and not yf_history.empty:
-                security_returns = yf_history['Close'].pct_change()
-                market_returns = market_data['Close'].pct_change()
-                # Align dates
-                common_dates = security_returns.index.intersection(market_returns.index)
-                if len(common_dates) > 30:  # Require at least 30 days of data
-                    correlation = security_returns[common_dates].corr(market_returns[common_dates])
-                    # Higher correlation means lower diversification benefit
-                    risk_factors['market_correlation'] = min(1.0, max(0.0, abs(correlation)))
-        except Exception as e:
-            self.logger.debug(f"Could not calculate market correlation: {str(e)}")
+        # Calculate volatility risk (25% weight)
+        if volatility_metrics['std_dev'] is not None:
+            risk_factors['volatility_risk'] = min(volatility_metrics['std_dev'] * 10, 12.5)
+        if volatility_metrics['max_drawdown'] is not None:
+            risk_factors['volatility_risk'] += min(volatility_metrics['max_drawdown'] * 100, 12.5)
 
-        # 3. Trend-based Risk
-        try:
-            if not yf_history.empty:
-                prices = yf_history['Close']
-                sma_50 = prices.rolling(window=50).mean()
-                sma_200 = prices.rolling(window=200).mean()
-                
-                if len(prices) >= 200:
-                    current_price = prices.iloc[-1]
-                    price_below_50ma = current_price < sma_50.iloc[-1]
-                    price_below_200ma = current_price < sma_200.iloc[-1]
-                    death_cross = sma_50.iloc[-1] < sma_200.iloc[-1]
-                    
-                    trend_risk = 0.5  # Base risk
-                    if price_below_50ma and price_below_200ma:
-                        trend_risk += 0.3
-                    if death_cross:
-                        trend_risk += 0.2
-                        
-                    risk_factors['trend'] = min(1.0, trend_risk)
-        except Exception as e:
-            self.logger.debug(f"Could not calculate trend risk: {str(e)}")
-
-        # 4. Enhanced Sector Risk
-        sector = yf_info.get('sector')
-        industry = yf_info.get('industry')
-        
-        sector_risk_map = {
-            'Technology': {
-                'Software': 0.85,
-                'Hardware': 0.75,
-                'Semiconductors': 0.90,
-                'Internet Content': 0.85,
-                '_default': 0.80
-            },
-            'Healthcare': {
-                'Biotechnology': 0.95,
-                'Medical Devices': 0.70,
-                'Healthcare Providers': 0.60,
-                'Pharmaceuticals': 0.75,
-                '_default': 0.75
-            },
-            'Financial': {
-                'Banks': 0.65,
-                'Insurance': 0.60,
-                'Investment Management': 0.75,
-                'FinTech': 0.85,
-                '_default': 0.70
-            },
-            'Consumer Cyclical': {
-                'Retail': 0.70,
-                'Automotive': 0.75,
-                'Entertainment': 0.80,
-                '_default': 0.70
-            },
-            'Energy': {
-                'Oil & Gas': 0.85,
-                'Renewable Energy': 0.90,
-                '_default': 0.80
-            },
-            '_default': 0.70
-        }
-        
-        if sector:
-            sector_risks = sector_risk_map.get(sector, sector_risk_map['_default'])
-            if isinstance(sector_risks, dict):
-                risk_factors['sector'] = sector_risks.get(industry, sector_risks['_default'])
+        # Calculate market risk (20% weight)
+        beta = security.get('Beta', 1.0)
+        if 'Beta' in security:
+            # Beta < 1 means lower volatility relative to market
+            # Beta > 1 means higher volatility relative to market
+            if beta < 1.0:
+                beta_deviation = 1.0 - beta
+                if beta_deviation <= 0.2:  # Slightly defensive (0.8-1.0)
+                    risk_factors['market_risk'] = 5
+                elif beta_deviation <= 0.5:  # Moderately defensive (0.5-0.8)
+                    risk_factors['market_risk'] = 8
+                else:  # Very defensive (< 0.5)
+                    risk_factors['market_risk'] = 10
+            else:
+                beta_deviation = beta - 1.0
+                if beta_deviation <= 0.2:  # Slightly aggressive (1.0-1.2)
+                    risk_factors['market_risk'] = 10
+                elif beta_deviation <= 0.5:  # Moderately aggressive (1.2-1.5)
+                    risk_factors['market_risk'] = 15
+                else:  # Very aggressive (> 1.5)
+                    risk_factors['market_risk'] = 20
         else:
-                risk_factors['sector'] = sector_risks
+            risk_factors['market_risk'] = 15  # Default risk for missing beta
 
-        # 5. Debt Risk (Enhanced)
-        debt_to_equity = yf_info.get('debtToEquity')
-        current_ratio = yf_info.get('currentRatio')
-        if debt_to_equity is not None:
-            risk_factors['debt'] = min(1.0, max(0.0, (debt_to_equity / 100) / 2.0))
-            if current_ratio is not None and current_ratio < 1.0:
-                risk_factors['debt'] = min(1.0, risk_factors['debt'] + 0.2)
+        # Calculate financial risk (20% weight)
+        market_cap = security.get('Market Cap', 0)
+        if market_cap < 1e9:  # Less than 1B
+            risk_factors['financial_risk'] += 12
+        elif market_cap < 10e9:  # Less than 10B
+            risk_factors['financial_risk'] += 8
+        elif market_cap < 100e9:  # Less than 100B
+            risk_factors['financial_risk'] += 4
 
-        # 6. Profitability Risk (Enhanced)
-        profit_margin = yf_info.get('profitMargins')
-        operating_margin = yf_info.get('operatingMargins')
-        if profit_margin is not None:
-            risk_factors['profitability'] = min(1.0, max(0.0, (0.20 - profit_margin) / 0.40))
-            if operating_margin is not None and operating_margin < 0:
-                risk_factors['profitability'] = min(1.0, risk_factors['profitability'] + 0.2)
+        # Add debt and profitability risk
+        debt_to_equity = yf_info.get('debtToEquity', 0)
+        profit_margins = yf_info.get('profitMargins', 0)
+        if debt_to_equity > 2:
+            risk_factors['financial_risk'] += 4
+        if profit_margins < 0:
+            risk_factors['financial_risk'] += 4
 
-        # 7. Size Risk (Enhanced)
-        market_cap = security.get('Market Cap')
-        if market_cap is not None and market_cap > 0:
-            log_cap = np.log10(market_cap)
-            risk_factors['size'] = min(1.0, max(0.0, (11.3 - log_cap) / (11.3 - 8.7)))
-            # Add volume-based size risk
-            avg_volume = yf_info.get('averageVolume')
-            if avg_volume is not None and avg_volume < 100000:  # Low liquidity threshold
-                risk_factors['size'] = min(1.0, risk_factors['size'] + 0.1)
-
-        # 8. RSI Extreme Risk
-        rsi_input = security.get('rsi')
-        if rsi_input is not None:
-            rsi_risk = abs(rsi_input - 0.5) / 0.4
-            risk_factors['rsi_extreme'] = min(1.0, max(0.0, rsi_risk))
-
-        # 9. Liquidity Risk
-        avg_volume = yf_info.get('averageVolume')
-        if avg_volume is not None:
-            risk_factors['liquidity'] = min(1.0, max(0.0, (1000000 - avg_volume) / 1000000))
-
-        # 10. Earnings Quality
-        earnings_growth = yf_info.get('earningsGrowth')
-        revenue_growth = yf_info.get('revenueGrowth')
-        if earnings_growth is not None and revenue_growth is not None:
-            if earnings_growth < 0 or revenue_growth < 0:
-                risk_factors['earnings_quality'] = 0.8
-            elif earnings_growth < revenue_growth:
-                risk_factors['earnings_quality'] = 0.6
-
-        # 11. Institutional Ownership
-        institution_holding = yf_info.get('heldPercentInstitutions')
-        if institution_holding is not None:
-            if institution_holding < 0.2:
-                risk_factors['institutional'] = 0.8
-            elif institution_holding < 0.5:
-                risk_factors['institutional'] = 0.6
-
-        # 12. Short Interest
-        short_ratio = yf_info.get('shortRatio')
-        if short_ratio is not None:
-            risk_factors['short_interest'] = min(1.0, max(0.0, (short_ratio - 2) / 10))
-
-        # Combine Factors with Updated Weights
-        weights = {
-            'volatility': 0.20,
-            'debt': 0.12,
-            'profitability': 0.10,
-            'size': 0.08,
-            'rsi_extreme': 0.05,
-            'liquidity': 0.10,
-            'sector': 0.10,
-            'earnings_quality': 0.05,
-            'institutional': 0.05,
-            'short_interest': 0.05,
-            'market_correlation': 0.05,
-            'trend': 0.05
+        # Calculate sector risk (20% weight)
+        sector_risk_map = {
+            'Technology': 20,
+            'Healthcare': 16,
+            'Financial Services': 14,
+            'Consumer Cyclical': 12,
+            'Communication Services': 10,
+            'Industrials': 8,
+            'Consumer Defensive': 6,
+            'Utilities': 4,
+            'Energy': 3,
+            'Real Estate': 2,
+            'Basic Materials': 1
         }
+        industry = security.get('Industry', 'Unknown')
+        risk_factors['sector_risk'] = sector_risk_map.get(industry, 15)  # Higher default risk for unknown industry
 
-        total_risk_score_normalized = sum(risk_factors[factor] * weights[factor] for factor in weights)
-        final_risk_score = int(round(total_risk_score_normalized * 100))
+        # Calculate technical risk (15% weight)
+        rsi = security.get('rsi', 0.5)
+        if 'rsi' in security:
+            # Lower risk for RSI close to 0.5, higher risk for extreme values
+            rsi_deviation = abs(rsi - 0.5)
+            if rsi_deviation <= 0.1:  # Close to neutral
+                risk_factors['technical_risk'] += 2
+            elif rsi_deviation <= 0.2:  # Moderately extreme
+                risk_factors['technical_risk'] += 4
+            else:  # Very extreme
+                risk_factors['technical_risk'] += min(rsi_deviation * 25, 7.5)
+        else:
+            risk_factors['technical_risk'] += 5  # Default risk for missing RSI
+
+        volume_change = security.get('volume_change_50d', 0)
+        if 'volume_change_50d' in security:
+            # Lower risk for small volume changes
+            if abs(volume_change) <= 0.1:  # Small change
+                risk_factors['technical_risk'] += 2
+            elif abs(volume_change) <= 0.3:  # Moderate change
+                risk_factors['technical_risk'] += 4
+            else:  # Large change
+                risk_factors['technical_risk'] += min(abs(volume_change) * 5, 7.5)
+        else:
+            risk_factors['technical_risk'] += 5  # Default risk for missing volume change
+
+        # Calculate final risk score (0-100)
+        total_risk = (
+            risk_factors['volatility_risk'] +
+            risk_factors['market_risk'] +
+            risk_factors['financial_risk'] +
+            risk_factors['sector_risk'] +
+            risk_factors['technical_risk'] +
+            missing_data_penalty  # Add penalty for missing data
+        )
+
+        # Ensure score is between 0 and 100
+        final_score = min(max(int(total_risk), 0), 100)
         
-        return min(100, max(0, final_risk_score))  # Ensure score is between 0 and 100
+        self.logger.debug(f"Risk score for {ticker}: {final_score}")
+        return final_score
 
     def run_risk_analysis(self) -> Union[Dict[str, Any], bool]:
         """

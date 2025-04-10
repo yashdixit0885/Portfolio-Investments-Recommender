@@ -67,8 +67,8 @@ def save_to_json(data: Union[Dict[str, Any], List[Any]], filepath: str) -> bool:
         data: Dictionary or list to save
         filepath: Full path to the file
         
-    Returns:
-        bool: True if successful, False otherwise
+    Raises:
+        Exception: If there is an error saving the file
     """
     try:
         # Create directory if it doesn't exist
@@ -79,7 +79,7 @@ def save_to_json(data: Union[Dict[str, Any], List[Any]], filepath: str) -> bool:
         return True
     except Exception as e:
         logging.error(f"Error saving to JSON: {str(e)}")
-        return False
+        raise  # Re-raise the exception
 
 def load_from_json(filepath: str) -> Optional[Union[Dict[str, Any], List[Any]]]:
     """

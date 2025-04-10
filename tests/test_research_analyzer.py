@@ -154,6 +154,7 @@ class TestResearchAnalyzer:
             result = analyzer._calculate_risk_score(minimal_security)
             assert isinstance(result, int)
             assert 0 <= result <= 100
+            assert result >= 50  # Higher risk due to missing data
             
             # Test case 2: Extreme values
             extreme_security = {
@@ -165,10 +166,13 @@ class TestResearchAnalyzer:
                 'price_momentum_50d': 2.0,  # Extreme momentum
                 'price_momentum_200d': 2.0,  # Extreme momentum
                 'volume_change_50d': 5.0,  # Extreme volume change
-                'volume_change_200d': 5.0   # Extreme volume change
+                'volume_change_200d': 5.0,   # Extreme volume change
+                'Industry': 'Technology'
             }
             result = analyzer._calculate_risk_score(extreme_security)
             assert result > 70  # Should be high risk
+            assert isinstance(result, int)
+            assert result <= 100
             
             # Test case 3: All fields null/zero
             null_security = {
@@ -178,11 +182,32 @@ class TestResearchAnalyzer:
                 'Market Cap': 0,
                 'Volume': 0,
                 'price_momentum_50d': 0,
-                'price_momentum_200d': 0
+                'price_momentum_200d': 0,
+                'volume_change_50d': 0,
+                'volume_change_200d': 0,
+                'Industry': 'Unknown'
             }
             result = analyzer._calculate_risk_score(null_security)
             assert isinstance(result, int)
+            assert result >= 60  # Higher risk due to zero/null values
             assert 0 <= result <= 100
+            
+            # Test case 4: Balanced/moderate risk security
+            moderate_security = {
+                'Ticker': 'MOD',
+                'Beta': 1.0,
+                'rsi': 0.5,
+                'Market Cap': 10000000000,  # 10B market cap
+                'Volume': 1000000,
+                'price_momentum_50d': 0.1,
+                'price_momentum_200d': 0.15,
+                'volume_change_50d': 0.05,
+                'volume_change_200d': 0.08,
+                'Industry': 'Consumer Defensive'
+            }
+            result = analyzer._calculate_risk_score(moderate_security)
+            assert 25 <= result <= 75  # Should be moderate risk
+            assert isinstance(result, int)
 
     def test_run_risk_analysis_error_handling(self, analyzer, tmp_path):
         """Test error handling in run_risk_analysis method."""

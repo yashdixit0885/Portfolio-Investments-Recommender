@@ -62,11 +62,24 @@ def run_analysis_cycle() -> None:
         research_analyzer = ResearchAnalyzer()
         trade_analyzer = TradeAnalyzer()
         
-        # Run investment analysis
-        investment_results = investment_analyzer.run_analysis()
-        if not investment_results:
-            logger.warning("No securities passed investment analysis")
-            return
+        # Run investment analysis with retry
+        max_retries = 3
+        retry_delay = 5  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                investment_results = investment_analyzer.run_analysis()
+                if not investment_results:
+                    logger.warning("No securities passed investment analysis")
+                    return
+                break  # Success, exit retry loop
+            except Exception as e:
+                if "Rate limit" in str(e) and attempt < max_retries - 1:
+                    logger.warning(f"Rate limit exceeded, retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                raise  # Re-raise if not a rate limit error or last attempt
             
         # Run research analysis
         research_results = research_analyzer.run_risk_analysis()

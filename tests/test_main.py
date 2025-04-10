@@ -8,6 +8,8 @@ from src.main import run_analysis_cycle, setup_environment, main
 from src.investment_analyst.investment_analyzer import InvestmentAnalyzer
 from src.research_analyst.research_analyzer import ResearchAnalyzer
 from src.trade_analyst.trade_analyzer import TradeAnalyzer
+from src.utils.common import save_to_json
+import time
 
 class TestMainApplication:
     """Critical tests for the main application."""
@@ -285,4 +287,93 @@ class TestMainApplication:
             
             # Verify setup was called but run_analysis_cycle was not
             mock_setup.assert_called_once()
-            mock_run.assert_not_called() 
+            mock_run.assert_not_called()
+
+    def test_setup_environment_success(self):
+        """Test successful environment setup."""
+        with patch('src.main.load_dotenv', return_value=True), \
+             patch('src.main.setup_logging', return_value=logging.getLogger()):
+            result = setup_environment()
+            assert result is True
+
+    def test_setup_environment_failure(self):
+        """Test environment setup failure scenarios."""
+        # Test dotenv failure
+        with patch('src.main.load_dotenv', side_effect=Exception("Dotenv error")), \
+             patch('src.main.setup_logging', return_value=logging.getLogger()):
+            result = setup_environment()
+            assert result is False
+        
+        # Test logging setup failure
+        with patch('src.main.load_dotenv', return_value=True), \
+             patch('src.main.setup_logging', return_value=None):
+            result = setup_environment()
+            assert result is False
+
+    def test_main_directory_creation(self, tmp_path):
+        """Test directory creation in main function."""
+        with patch('src.main.DATA_DIR', str(tmp_path / 'data')), \
+             patch('src.main.OUTPUT_DIR', str(tmp_path / 'output')), \
+             patch('src.main.setup_environment', return_value=True), \
+             patch('src.main.get_logger', return_value=logging.getLogger()), \
+             patch('src.main.run_analysis_cycle'):
+            main()
+            assert os.path.exists(str(tmp_path / 'data'))
+            assert os.path.exists(str(tmp_path / 'output'))
+
+    def test_main_error_handling(self):
+        """Test error handling in main function."""
+        # Test environment setup failure
+        with patch('src.main.setup_environment', return_value=False), \
+             patch('src.main.get_logger', return_value=logging.getLogger()):
+            main()
+            # Should exit gracefully without raising exceptions
+
+    def test_run_analysis_cycle_with_rate_limit(self):
+        """Test run_analysis_cycle with rate limiting."""
+        with patch('src.main.InvestmentAnalyzer') as mock_investment, \
+             patch('src.main.ResearchAnalyzer') as mock_research, \
+             patch('src.main.TradeAnalyzer') as mock_trade, \
+             patch('time.sleep') as mock_sleep:  # Mock sleep to avoid actual delays
+            
+            # Setup mock instances
+            mock_investment_instance = mock_investment.return_value
+            mock_research_instance = mock_research.return_value
+            mock_trade_instance = mock_trade.return_value
+            
+            # Configure mock to raise rate limit error first, then succeed
+            mock_investment_instance.run_analysis.side_effect = [
+                Exception("Rate limit exceeded"),  # First call fails
+                True  # Second call succeeds
+            ]
+            mock_research_instance.run_risk_analysis.return_value = True
+            mock_trade_instance.generate_trade_signals.return_value = True
+            
+            # Run the function
+            run_analysis_cycle()
+            
+            # Verify retries
+            assert mock_investment_instance.run_analysis.call_count == 2
+            mock_research_instance.run_risk_analysis.assert_called_once()
+            mock_trade_instance.generate_trade_signals.assert_called_once()
+            mock_sleep.assert_called()  # Verify that sleep was called for rate limit backoff
+
+    def test_save_to_json_error_handling(self, tmp_path):
+        """Test error handling in save_to_json function."""
+        test_data = {'test': 'data'}
+        
+        # Test with invalid path
+        with pytest.raises(Exception):
+            save_to_json(test_data, '/invalid/path/file.json')
+        
+        # Test with invalid data
+        with pytest.raises(Exception):
+            save_to_json(object(), str(tmp_path / 'test.json'))
+        
+        # Test successful save
+        valid_path = tmp_path / 'valid.json'
+        save_to_json(test_data, str(valid_path))
+        assert valid_path.exists()
+        with open(valid_path) as f:
+            saved_data = json.load(f)
+            assert saved_data == test_data 
