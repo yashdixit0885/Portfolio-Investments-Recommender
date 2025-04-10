@@ -43,7 +43,7 @@ import json
 import pandas as pd
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from src.utils.common import save_to_json, load_from_json, get_current_time, save_recommendations_to_csv
 import numpy as np
 import yfinance as yf
@@ -237,71 +237,60 @@ class InvestmentAnalyzer:
         Load and prepare securities data for analysis.
         
         Args:
-            df (pd.DataFrame, optional): DataFrame containing securities data.
-                                      If None, data will be loaded from self.input_file.
+            df (pd.DataFrame, optional): DataFrame to process. If None, load from input_file.
             
         Returns:
             pd.DataFrame: Prepared securities data.
         """
         try:
-            # Load data if not provided
             if df is None:
                 if not os.path.exists(self.input_file):
-                    self.logger.error(f"Input file {self.input_file} not found")
+                    self.logger.error(f"Input file not found: {self.input_file}")
                     return pd.DataFrame()
                 df = pd.read_csv(self.input_file)
             
-            # Create a copy to avoid modifying the original
-            df = df.copy()
-            
-            # Rename columns to match our expected format
-            column_mappings = {
+            # Rename columns for consistency
+            column_mapping = {
                 'Symbol': 'Ticker',
                 'Last': 'Price',
+                '% Insider': 'Inst Own %',
+                'Div Yield(a)': 'Div Yield',
+                '50D Avg Vol': 'Volume_MA50',
+                '200D Avg Vol': 'Volume_MA200',
                 '50D MA': 'MA50',
-                '200D MA': 'MA200',
-                '% Insider': 'Inst Own %'  # Map % Insider to Inst Own %
+                '200D MA': 'MA200'
             }
-            df = df.rename(columns=column_mappings)
-            
-            # Clean percentage columns
-            percentage_columns = ['Short %', 'Inst Own %', 'Float %', 'Div Yield(a)']
-            for col in percentage_columns:
-                if col in df.columns:
-                    df[col] = df[col].apply(lambda x: float(str(x).strip('%')) / 100 if pd.notnull(x) else 0.0)
+            df = df.rename(columns=column_mapping)
             
             # Clean numeric columns
-            numeric_columns = ['Price', 'MA50', 'MA200', 'Volume']
+            numeric_columns = [
+                'Price', 'Volume', 'Volume_MA50', 'Volume_MA200',
+                'MA50', 'MA200', 'RSI', 'Beta', 'MACD', 'MACD Signal',
+                'Inst Own %', 'Div Yield', 'Market Cap', 'Price Vol',
+                'P/E fwd', 'Price/Book', 'Debt/Equity', 'ATR', 'BB Width',
+                'Stoch %K', 'Stoch %D', 'ADX', 'OBV', 'VWAP'
+            ]
+            
             for col in numeric_columns:
                 if col in df.columns:
                     df[col] = df[col].apply(self._clean_numeric)
             
-            # Calculate price momentum scores
-            if all(col in df.columns for col in ['Price', 'MA50']):
-                df['price_momentum_50d'] = (df['Price'] - df['MA50']) / df['MA50']
-            else:
-                df['price_momentum_50d'] = 0.0
-                
-            if all(col in df.columns for col in ['Price', 'MA200']):
-                df['price_momentum_200d'] = (df['Price'] - df['MA200']) / df['MA200']
-            else:
-                df['price_momentum_200d'] = 0.0
-                
-            # Calculate volume changes
-            if 'Volume' in df.columns and '50D Avg Vol' in df.columns:
-                df['volume_change_50d'] = (df['Volume'] - df['50D Avg Vol']) / df['50D Avg Vol']
-            else:
-                df['volume_change_50d'] = 0.0
-                
-            if 'Volume' in df.columns and '200D Avg Vol' in df.columns:
-                df['volume_change_200d'] = (df['Volume'] - df['200D Avg Vol']) / df['200D Avg Vol']
-            else:
-                df['volume_change_200d'] = 0.0
+            # Calculate additional metrics
+            if all(col in df.columns for col in ['Volume', 'Volume_MA50', 'Volume_MA200']):
+                df['volume_change_50d'] = (df['Volume'] / df['Volume_MA50']) - 1
+                df['volume_change_200d'] = (df['Volume'] / df['Volume_MA200']) - 1
+            
+            if all(col in df.columns for col in ['Price', 'MA50', 'MA200']):
+                df['price_momentum_50d'] = (df['Price'] / df['MA50']) - 1
+                df['price_momentum_200d'] = (df['Price'] / df['MA200']) - 1
+            
+            # Add timestamp
+            df['analysis_timestamp'] = get_current_time()
             
             return df
             
         except Exception as e:
-            self.logger.error(f"Error loading securities data: {str(e)}")
+            self.logger.error(f"Error preparing securities data: {str(e)}")
             return pd.DataFrame()
 
     def _calculate_price_movement_potential(self, df):
@@ -412,30 +401,34 @@ class InvestmentAnalyzer:
             self.logger.error(f"Error identifying potential movers: {str(e)}")
             return pd.DataFrame()
 
-    def save_potential_securities(self, securities: List[Dict[str, Any]]) -> bool:
-        """Save the identified high-potential securities to a JSON file."""
+    def save_potential_securities(self, securities: List[Dict]) -> bool:
+        """Save the list of high-potential securities to a JSON file.
+
+        Args:
+            securities (List[Dict]): List of dictionaries containing security data.
+
+        Returns:
+            bool: True if save was successful, False otherwise.
+        """
         try:
             if not securities:
-                self.logger.warning("No high-potential securities found or provided to save.")
+                self.logger.warning("No securities data provided.")
                 return False
 
-            # Validate and clean securities data
             valid_securities = []
             for security in securities:
-                if not isinstance(security, dict):
-                    continue
-                    
-                # Check required fields
-                required_fields = ['Symbol', 'Price', 'Volume']
-                if not all(field in security for field in required_fields):
-                    continue
-                    
-                # Validate numeric fields
                 try:
+                    # Ensure required fields exist and are valid
+                    if not all(key in security for key in ['Symbol', 'Price', 'Volume', 'movement_potential_score']):
+                        continue
+                    
+                    # Convert numeric fields
                     security['Price'] = float(security['Price'])
                     security['Volume'] = float(security['Volume'])
+                    security['movement_potential_score'] = float(security['movement_potential_score'])
                     valid_securities.append(security)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, KeyError) as e:
+                    self.logger.warning(f"Invalid security data: {str(e)}")
                     continue
 
             if not valid_securities:

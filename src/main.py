@@ -1,9 +1,13 @@
+import logging
+from datetime import datetime
+import json
+from pathlib import Path
 import os
 import time
 import schedule
-import logging
-from datetime import datetime
 from dotenv import load_dotenv
+import pandas as pd
+import traceback
 
 # Import the refactored analyzer classes
 from src.investment_analyst.investment_analyzer import InvestmentAnalyzer
@@ -13,91 +17,121 @@ from src.trade_analyst.trade_analyzer import TradeAnalyzer
 
 from src.utils.common import setup_logging
 # from src.utils.json_utils import load_from_json # No longer needed here
+from src.utils.logger import get_logger
+from src.utils.config import setup_environment
 
-def setup_environment():
-    """Load .env file (if exists) and setup logging"""
-    try:
-        load_dotenv() # Load environment variables from .env file, if present
-        logger = setup_logging('main') # Setup centralized logging
-        logger.info("Environment setup complete.")
-        return True
-    except Exception as e:
-        logging.error(f"Environment setup failed: {str(e)}")
-        return False
+# Constants
+MAX_RISK_THRESHOLD = 80  # Maximum acceptable risk score for trade analysis
+DATA_DIR = 'data'
+OUTPUT_DIR = 'output'
+
+def save_to_json(data, filepath):
+    """Save data to a JSON file."""
+    output_path = Path(filepath)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump(data, f, indent=4)
 
 def run_analysis_cycle():
-    """Run one complete analysis cycle from Investment to Trade Analysis."""
-    logger = logging.getLogger('main')
-    logger.info("Starting new analysis cycle...")
-    
-    cycle_successful = True
+    """Run a complete analysis cycle."""
+    logger = get_logger()
+    logger.info("Starting new analysis cycle")
     
     try:
-        # 1. Investment Analysis
-        logger.info("[Stage 1/3] Running Investment Analysis...")
-        investment_analyzer = InvestmentAnalyzer()
-        if not investment_analyzer.run_analysis():
-            logger.error("Investment Analysis failed or produced no results. Stopping cycle.")
-            cycle_successful = False
-            return # Stop the cycle if this stage fails
-        logger.info("Investment Analysis completed.")
-        
-        # 2. Research Analysis
-        logger.info("[Stage 2/3] Running Research Analysis (Risk Scoring)...")
+        # Initialize analyzers
         research_analyzer = ResearchAnalyzer()
-        if not research_analyzer.run_risk_analysis():
-            logger.error("Research Analysis failed or produced no results. Stopping cycle.")
-            cycle_successful = False
-            return # Stop the cycle if this stage fails
-        logger.info("Research Analysis completed.")
-        
-        # 3. Trade Analysis
-        logger.info("[Stage 3/3] Running Trade Analysis (Signal Generation)...")
         trade_analyzer = TradeAnalyzer()
-        if not trade_analyzer.generate_trade_signals():
-            logger.error("Trade Analysis failed or produced no results.")
-            cycle_successful = False
-            # Allow cycle to finish logging even if last step fails
-        else:
-            logger.info("Trade Analysis completed.")
+        
+        # Read securities from CSV file
+        securities_file = os.path.join(DATA_DIR, 'securities_data.csv')
+        if not os.path.exists(securities_file):
+            logger.error(f"Securities data file not found: {securities_file}")
+            return
             
-        # 4. Portfolio Management (Removed for now)
-        # logger.info("[Stage 4/4] Running Portfolio Management...")
-        # portfolio_manager = PortfolioManager()
-        # portfolio_manager.process_trade_analysis()
-        # logger.info("Portfolio Management completed.")
+        # Read securities from CSV using pandas
+        try:
+            securities_df = pd.read_csv(securities_file)
+            potential_securities = securities_df['Symbol'].dropna().unique().tolist()
+            logger.info(f"Found {len(potential_securities)} unique securities for analysis")
+        except Exception as e:
+            logger.error(f"Error reading securities data: {str(e)}")
+            logger.error(traceback.format_exc())
+            return
         
-        if cycle_successful:
-            logger.info("Analysis cycle completed successfully.")
+        if not potential_securities:
+            logger.warning("No potential securities found for analysis")
+            return
+            
+        # Run research analysis
+        try:
+            analysis_results = research_analyzer.run_risk_analysis(potential_securities)
+            if not analysis_results:
+                logger.warning("No securities passed research analysis")
+                return
+            logger.info(f"Research analysis completed for {len(analysis_results)} securities")
+        except Exception as e:
+            logger.error(f"Error in research analysis: {str(e)}")
+            logger.error(traceback.format_exc())
+            return
+            
+        # Process each analyzed security through trade analysis
+        trade_recommendations = []
+        for symbol, result in analysis_results.items():
+            try:
+                if result['risk_score'] > MAX_RISK_THRESHOLD:
+                    logger.debug(f"Skipping {symbol} due to high risk score: {result['risk_score']}")
+                    continue
+                    
+                historical_data = result['historical_data']
+                trade_analysis = trade_analyzer.analyze_security(historical_data)
+                
+                if trade_analysis:
+                    trade_recommendations.append({
+                        'symbol': symbol,
+                        'risk_score': result['risk_score'],
+                        'trade_score': trade_analysis.get('trade_score', 0),
+                        'recommendation': trade_analysis.get('recommendation', 'HOLD'),
+                        'justification': trade_analysis.get('justification', '')
+                    })
+                    logger.info(f"Added trade recommendation for {symbol}")
+            except Exception as e:
+                logger.error(f"Error analyzing {symbol}: {str(e)}")
+                logger.error(traceback.format_exc())
+                continue
+        
+        # Save final recommendations
+        if trade_recommendations:
+            output_data = {
+                'timestamp': datetime.now().isoformat(),
+                'recommendations': trade_recommendations
+            }
+            output_file = os.path.join(OUTPUT_DIR, 'trade_recommendations.json')
+            save_to_json(output_data, output_file)
+            logger.info(f"Generated {len(trade_recommendations)} trade recommendations")
         else:
-             logger.warning("Analysis cycle completed with errors.")
-        
+            logger.warning("No trade recommendations generated")
+            
     except Exception as e:
-        logger.critical(f"Critical error during analysis cycle: {str(e)}", exc_info=True)
+        logger.error(f"Error in analysis cycle: {str(e)}")
+        logger.error(traceback.format_exc())
 
 def main():
     """Main function to run the AI Trader framework."""
+    # Create necessary directories
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
     if not setup_environment():
         logging.critical("Environment setup failed. Exiting.")
         return
         
-    logger = logging.getLogger('main')
+    logger = get_logger('main')
     logger.info("Starting AI Trader framework")
     
-    # --- Scheduling Option (Commented out for single run) ---
-    # logger.info("Scheduling analysis cycle every 5 minutes.")
-    # schedule.every(5).minutes.do(run_analysis_cycle)
-    # run_analysis_cycle() # Run once immediately
-    # while True:
-    #     schedule.run_pending()
-    #     time.sleep(60) # Check every minute
-    # --- End Scheduling Option ---
-    
-    # --- Single Run Option ---
+    # Run a single analysis cycle
     logger.info("Running a single analysis cycle.")
     run_analysis_cycle()
     logger.info("AI Trader framework finished.")
-    # --- End Single Run Option ---
 
 if __name__ == "__main__":
     main()
