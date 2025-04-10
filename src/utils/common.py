@@ -170,38 +170,33 @@ def validate_email(email):
     except Exception:
         return False
 
-def save_recommendations_to_csv(recommendations: List[Dict[str, Any]], output_dir: str = "Output") -> str:
-    """
-    Save trade recommendations to a CSV file.
-    
-    Args:
-        recommendations: List of recommendation dictionaries
-        output_dir: Directory to save the CSV file
-        
-    Returns:
-        str: Path to the saved CSV file
-    """
+def save_recommendations_to_csv(recommendations: List[Dict[str, Any]], filepath: str) -> bool:
+    """Save trade recommendations to a CSV file."""
     try:
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
+        # Ensure the output directory exists
+        output_dir = os.path.dirname(filepath)
+        if output_dir:
+             os.makedirs(output_dir, exist_ok=True)
         
         if not recommendations:
-            # Create empty file
-            filepath = os.path.join(output_dir, 'recommendations.csv')
-            with open(filepath, 'w') as f:
-                f.write('ticker,name,action,score,position_size,price,market_cap,price_change,volume_change,rationale\n')
-            return filepath
-        
-        # Convert to DataFrame
+            logging.warning("No recommendations to save.")
+            # Create empty file or just return True?
+            # Let's create an empty file with headers for consistency
+            df = pd.DataFrame(columns=['ticker', 'name', 'signal', 'timeframe', 'confidence', 'price', 'position_size', 'justification'])
+            df.to_csv(filepath, index=False)
+            return True
+
         df = pd.DataFrame(recommendations)
+        # Ensure specific column order
+        columns_order = ['ticker', 'name', 'signal', 'timeframe', 'confidence', 'price', 'position_size', 'justification']
+        df = df[columns_order] # Reorder columns
         
-        # Save to CSV
-        filepath = os.path.join(output_dir, 'recommendations.csv')
         df.to_csv(filepath, index=False)
-        return filepath
+        logging.info(f"Successfully saved {len(df)} recommendations to {filepath}")
+        return True
     except Exception as e:
-        logging.error(f"Error saving recommendations: {str(e)}")
-        raise
+        logging.error(f"Error saving recommendations: {e}")
+        return False
 
 def archive_and_cleanup_files(output_dir, archive_dir):
     """Archive files at 5 PM MT and cleanup at 7 AM MT."""
@@ -229,17 +224,22 @@ def archive_and_cleanup_files(output_dir, archive_dir):
                     
         elif hour == 7:  # 7 AM MT
             # Cleanup files
-            for filename in os.listdir(output_dir):
-                if filename.endswith(('.csv', '.json')):
-                    filepath = os.path.join(output_dir, filename)
+            if os.path.exists(output_dir):
+                for filename in os.listdir(output_dir):
+                    if not filename.endswith(('.csv', '.json')): # Keep non-archivable files
+                         continue
+                    src = os.path.join(output_dir, filename)
                     try:
-                        if os.access(filepath, os.W_OK):
-                            os.remove(filepath)
-                        else:
-                            logging.warning(f"Could not remove read-only file: {filepath}")
-                    except (PermissionError, OSError) as e:
-                        logging.warning(f"Could not remove file {filepath}: {str(e)}")
-                    
+                        # Check write permissions before attempting removal
+                        if os.access(src, os.W_OK) and os.path.exists(src):
+                            os.remove(src)
+                        elif os.path.exists(src):
+                            logging.warning(f"Skipping cleanup of non-writable file: {src}")
+                    except Exception as e:
+                         logging.warning(f"Could not remove file {src}: {str(e)}")
+            else:
+                 logging.warning(f"Output directory {output_dir} not found for cleanup.")
+
     except Exception as e:
         logging.error(f"Error in archive_and_cleanup_files: {str(e)}")
         raise

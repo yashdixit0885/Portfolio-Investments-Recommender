@@ -48,13 +48,15 @@ from src.utils.common import save_to_json, load_from_json, get_current_time, sav
 import numpy as np
 import yfinance as yf
 from src.research_analyst.rate_limiter import RateLimiter
+from src.database import DatabaseManager
 
 class InvestmentAnalyzer:
     """Identifies securities with high price movement potential from source data for further research."""
     
-    def __init__(self):
+    def __init__(self, db: DatabaseManager):
         """Initialize the InvestmentAnalyzer with configuration and logging."""
         self.logger = logging.getLogger('investment_analyzer')
+        self.db = db
         self.data_dir = 'data'
         self.input_file = os.path.join(self.data_dir, 'securities_data.csv')
         self.output_file = os.path.join(self.data_dir, 'high_potential_securities.json')
@@ -115,51 +117,99 @@ class InvestmentAnalyzer:
             return 0.0
     
     def _fetch_yf_data(self, ticker: str) -> Dict[str, Any]:
-        """
-        Fetches necessary data from Yahoo Finance for a ticker.
-        
-        Args:
-            ticker (str): The stock ticker symbol.
-            
-        Returns:
-            Dict containing 'info' and 'history' data from Yahoo Finance.
-        """
-        if ticker in self.yf_data_cache:
-            return self.yf_data_cache[ticker]
-            
-        self.logger.debug(f"Fetching Yahoo Finance data for {ticker}")
+        """Fetch data from Yahoo Finance with rate limiting and DB fallback/update."""
         yf_data = {'info': {}, 'history': pd.DataFrame()}
         
+        # Check cache first
+        cache_key = f"{ticker}_data"
+        # Simplified cache check for now
+        # if cache_key in self.yf_data_cache:
+        #     self.logger.debug(f"Cache hit for {ticker}")
+        #     return self.yf_data_cache[cache_key]
+        
+        self.logger.debug(f"Fetching data for {ticker}...")
         try:
-            yf_stock = yf.Ticker(ticker)
+            # Attempt to fetch fresh data from yfinance first
+            stock = yf.Ticker(ticker)
+            info_data = {}
+            hist_data = pd.DataFrame()
+
+            try:
+                # Fetch info - No rate limiting needed for property access
+                # info_data = self.rate_limiter.call_with_retry(getattr(stock, 'info'))
+                info_data = stock.info
+                if not isinstance(info_data, dict):
+                    self.logger.warning(f"Received non-dict info for {ticker} from yfinance: {type(info_data)}. Falling back to DB.")
+                    info_data = {}
+            except Exception as e:
+                self.logger.warning(f"Error fetching info data for {ticker} from yfinance: {str(e)}. Falling back to DB.")
+                info_data = {}
+
+            # If yfinance info fetch failed, try getting from DB
+            if not info_data:
+                db_info = self.db.get_security(ticker)
+                if db_info:
+                    self.logger.debug(f"Using info data for {ticker} from database.")
+                    yf_data['info'] = db_info
+                else:
+                    self.logger.warning(f"No info data found for {ticker} in yfinance or DB.")
+            else:
+                 yf_data['info'] = info_data
+                 # Store/Update latest security info in database
+                 security_data_for_db = {
+                     'ticker': ticker,
+                     'name': info_data.get('longName', info_data.get('shortName', '')),
+                     'industry': info_data.get('industry', ''),
+                     'market_cap': info_data.get('marketCap'),
+                     'price': info_data.get('currentPrice', info_data.get('regularMarketPrice')),
+                     'volume': info_data.get('volume', info_data.get('regularMarketVolume')),
+                     'volume_ma50': info_data.get('averageVolume10days'), 
+                     'volume_ma200': info_data.get('averageVolume'),
+                     'ma50': info_data.get('fiftyDayAverage'),
+                     'ma200': info_data.get('twoHundredDayAverage'),
+                     'beta': info_data.get('beta'),
+                     'inst_own_pct': info_data.get('heldPercentInstitutions'),
+                     'div_yield': info_data.get('dividendYield')
+                 }
+                 # Clean None values before passing to DB insert
+                 security_data_for_db_cleaned = {k: v for k, v in security_data_for_db.items() if v is not None}
+                 self.db.insert_securities([security_data_for_db_cleaned])
+
+            try:
+                # Fetch history using rate limiter
+                hist_data = self.rate_limiter.call_with_retry(getattr(stock, 'history'), period='1y')
+                if hist_data is not None and not hist_data.empty:
+                    hist_data.columns = [col.lower() for col in hist_data.columns] # Ensure lowercase
+                    yf_data['history'] = hist_data
+                    # Ensure index is datetime
+                    if not isinstance(hist_data.index, pd.DatetimeIndex):
+                        hist_data.index = pd.to_datetime(hist_data.index)
+                    self.db.insert_historical_data(ticker, hist_data) # Store latest historical data
+                else:
+                    self.logger.warning(f"No historical data fetched from yfinance for {ticker}. Falling back to DB.")
+                    hist_data = pd.DataFrame() # Ensure hist_data is DataFrame for logic below
+            except Exception as e:
+                self.logger.warning(f"Error fetching historical data for {ticker} from yfinance: {str(e)}. Falling back to DB.")
+                hist_data = pd.DataFrame()
+
+            # If yfinance history fetch failed, try getting from DB
+            if hist_data.empty:
+                db_history = self.db.get_historical_data(ticker)
+                if db_history is not None and not db_history.empty:
+                    self.logger.debug(f"Using historical data for {ticker} from database.")
+                    # Ensure columns are lowercase if fetched from DB
+                    db_history.columns = [col.lower() for col in db_history.columns]
+                    yf_data['history'] = db_history
+                else:
+                    self.logger.warning(f"No historical data found for {ticker} in yfinance or DB.")
             
-            # Define callables for rate limiter
-            def get_info():
-                info_data = yf_stock.info
-                if not info_data or not info_data.get('regularMarketPrice'):
-                    self.logger.warning(f"No valid market data found for {ticker}")
-                    return {}
-                return info_data
-            
-            def get_history():
-                # Fetch 1 year of daily data for technical indicators
-                hist_data = yf_stock.history(period='1y', interval='1d')
-                if hist_data.empty:
-                    self.logger.warning(f"No valid history found for {ticker}")
-                    return pd.DataFrame()
-                return hist_data
-            
-            # Use rate limiter for API calls
-            yf_data['info'] = self.rate_limiter.call_with_retry(get_info)
-            if yf_data['info']:
-                yf_data['history'] = self.rate_limiter.call_with_retry(get_history)
+            # Cache the potentially combined data
+            # self.yf_data_cache[cache_key] = yf_data # Re-enable caching later if needed
+            return yf_data
             
         except Exception as e:
-            self.logger.error(f"Error fetching Yahoo Finance data for {ticker}: {str(e)}")
-            yf_data = {'info': {}, 'history': pd.DataFrame()}
-        
-        self.yf_data_cache[ticker] = yf_data
-        return yf_data
+            self.logger.error(f"General error in _fetch_yf_data for {ticker}: {str(e)}", exc_info=True)
+            return yf_data # Return default empty structure
 
     def _calculate_technical_indicators(self, historical_data):
         """Calculate technical indicators from historical price data."""
@@ -181,10 +231,10 @@ class InvestmentAnalyzer:
                 }
 
             # Convert DataFrame columns to Series for calculations
-            close = historical_data['Close']
-            high = historical_data['High']
-            low = historical_data['Low']
-            volume = historical_data['Volume']
+            close = historical_data['close']
+            high = historical_data['high']
+            low = historical_data['low']
+            volume = historical_data['volume']
 
             # Calculate ATR
             tr = pd.DataFrame()
@@ -196,26 +246,39 @@ class InvestmentAnalyzer:
 
             # Calculate Bollinger Bands
             bb_std = close.rolling(window=20).std()
-            bb_width = (bb_std * 2) / close.rolling(window=20).mean()
-            bb_width = bb_width.iloc[-1]
+            bb_mean = close.rolling(window=20).mean()
+            # Calculate width, handle division by zero
+            bb_width_series = np.where(bb_mean != 0, (bb_std * 2) / bb_mean, 0) 
+            # Convert numpy array back to pandas Series with original index to use iloc
+            bb_width_series = pd.Series(bb_width_series, index=close.index)
+            bb_width = bb_width_series.iloc[-1]
 
             # Calculate RSI
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             
+            rsi = 50.0 # Default for edge cases
             # Handle division by zero in RSI calculation
-            if loss.iloc[-1] == 0:
-                rsi = 100.0 if gain.iloc[-1] > 0 else 50.0
-            else:
-                rs = gain.iloc[-1] / loss.iloc[-1]
-                rsi = 100 - (100 / (1 + rs))
+            # Check if the last value of loss is NaN or zero
+            last_loss = loss.iloc[-1]
+            if pd.notna(last_loss) and last_loss == 0:
+                # If loss is zero, RSI is 100 if gain > 0, otherwise it implies flat price, RSI=50
+                last_gain = gain.iloc[-1]
+                if pd.notna(last_gain) and last_gain > 0:
+                    rsi = 100.0
+                # else rsi remains 50.0 (flat price or no change)
+            elif pd.notna(last_loss): # loss is non-zero and not NaN
+                rs = gain.iloc[-1] / last_loss
+                if pd.notna(rs):
+                    rsi = 100.0 - (100.0 / (1.0 + rs))
+            # If last_loss is NaN, rsi remains 50.0
 
-            # Replace NaN values with 0
+            # Replace NaN values with 0 or default RSI 50
             indicators = {
                 'atr': float(atr if pd.notna(atr) else 0.0),
                 'bb_width': float(bb_width if pd.notna(bb_width) else 0.0),
-                'rsi': float(rsi if pd.notna(rsi) else 50.0),
+                'rsi': float(rsi if pd.notna(rsi) else 50.0), # Use calculated RSI or default 50
                 'stoch_k': 0.0,  # Simplified for now
                 'stoch_d': 0.0,  # Simplified for now
                 'adx': 0.0,      # Simplified for now
@@ -227,86 +290,84 @@ class InvestmentAnalyzer:
             }
             
             return indicators
-
+            
         except Exception as e:
             self.logger.error(f"Error calculating technical indicators: {str(e)}")
             return {k: 0.0 for k in ['atr', 'bb_width', 'rsi', 'stoch_k', 'stoch_d', 'adx', 'obv', 'vwap', 'macd', 'macd_signal', 'macd_hist']}
 
     def load_and_prepare_securities(self, df=None):
-        """
-        Load and prepare securities data for analysis.
-        
-        Args:
-            df (pd.DataFrame, optional): DataFrame to process. If None, load from input_file.
-            
-        Returns:
-            pd.DataFrame: Prepared securities data.
-        """
+        """Load securities from the database and prepare for analysis."""
         try:
-            if df is None:
-                if not os.path.exists(self.input_file):
-                    self.logger.error(f"Input file not found: {self.input_file}")
-                    return pd.DataFrame()
-                df = pd.read_csv(self.input_file)
+            self.logger.info("Loading securities data from database...")
+            securities_data = self.db.get_all_securities()
             
-            # Rename columns for consistency
-            column_mapping = {
-                'Symbol': 'Ticker',
-                'Last': 'Price',
-                '% Insider': 'Inst Own %',
-                'Div Yield(a)': 'Div Yield',
-                '50D Avg Vol': 'Volume_MA50',
-                '200D Avg Vol': 'Volume_MA200',
-                '50D MA': 'MA50',
-                '200D MA': 'MA200'
-            }
-            df = df.rename(columns=column_mapping)
+            if not securities_data:
+                self.logger.warning("No securities found in the database.")
+                return pd.DataFrame()
             
-            # Clean numeric columns
-            numeric_columns = [
-                'Price', 'Volume', 'Volume_MA50', 'Volume_MA200',
-                'MA50', 'MA200', 'RSI', 'Beta', 'MACD', 'MACD Signal',
-                'Inst Own %', 'Div Yield', 'Market Cap', 'Price Vol',
-                'P/E fwd', 'Price/Book', 'Debt/Equity', 'ATR', 'BB Width',
-                'Stoch %K', 'Stoch %D', 'ADX', 'OBV', 'VWAP'
-            ]
+            df = pd.DataFrame(securities_data)
+            self.logger.info(f"Loaded {len(df)} securities from database")
+
+            # Apply filtering based on configuration
+            initial_count = len(df)
+            if 'volume' in df.columns:
+                df = df[df['volume'] >= self.min_volume]
+            if 'market_cap' in df.columns:
+                 df = df[df['market_cap'] >= self.min_market_cap]
+            filtered_count = len(df)
+            self.logger.info(f"Filtered securities: {initial_count} -> {filtered_count} (min_vol={self.min_volume}, min_cap={self.min_market_cap}) ")
+
+            if df.empty:
+                self.logger.warning("No securities met the filtering criteria.")
+                return pd.DataFrame()
             
-            for col in numeric_columns:
-                if col in df.columns:
-                    df[col] = df[col].apply(self._clean_numeric)
+            # Clean numeric values (already done in db_manager? Double check)
+            # Assume columns from DB are already clean and numeric
+            # numeric_columns = ['market_cap', 'price', 'volume', 'volume_ma50', 'volume_ma200',
+            #                  'ma50', 'ma200', 'beta', 'rsi', 'macd', 'inst_own_pct', 'div_yield']
+            # for col in numeric_columns:
+            #     if col in df.columns:
+            #         df[col] = df[col].apply(self._clean_numeric)
             
-            # Calculate additional metrics
-            if all(col in df.columns for col in ['Volume', 'Volume_MA50', 'Volume_MA200']):
-                df['volume_change_50d'] = (df['Volume'] / df['Volume_MA50']) - 1
-                df['volume_change_200d'] = (df['Volume'] / df['Volume_MA200']) - 1
+            # Calculate derived metrics needed for potential score
+            # Ensure required columns exist before calculation
+            required_cols = ['price', 'ma50', 'ma200', 'volume', 'volume_ma50', 'volume_ma200']
+            if not all(col in df.columns for col in required_cols):
+                 self.logger.error(f"Missing required columns for preparing securities: {required_cols}")
+                 # Fill missing required columns with 0 to avoid errors downstream, or return empty?
+                 for col in required_cols:
+                      if col not in df.columns:
+                           df[col] = 0.0 
+                 # Alternative: return pd.DataFrame()
+
+            # Use np.where to avoid division by zero
+            df['price_momentum_50d'] = np.where(df['ma50'] != 0, (df['price'] - df['ma50']) / df['ma50'], 0)
+            df['price_momentum_200d'] = np.where(df['ma200'] != 0, (df['price'] - df['ma200']) / df['ma200'], 0)
+            df['volume_change_50d'] = np.where(df['volume_ma50'] != 0, (df['volume'] - df['volume_ma50']) / df['volume_ma50'], 0)
+            df['volume_change_200d'] = np.where(df['volume_ma200'] != 0, (df['volume'] - df['volume_ma200']) / df['volume_ma200'], 0)
             
-            if all(col in df.columns for col in ['Price', 'MA50', 'MA200']):
-                df['price_momentum_50d'] = (df['Price'] / df['MA50']) - 1
-                df['price_momentum_200d'] = (df['Price'] / df['MA200']) - 1
-            
-            # Add timestamp
-            df['analysis_timestamp'] = get_current_time()
-            
+            # Fill NaNs that might result from division by zero or missing data
+            derived_cols = ['price_momentum_50d', 'price_momentum_200d', 'volume_change_50d', 'volume_change_200d']
+            df[derived_cols] = df[derived_cols].fillna(0.0)
+
+            self.logger.info("Finished preparing securities data")
             return df
             
         except Exception as e:
-            self.logger.error(f"Error preparing securities data: {str(e)}")
-            return pd.DataFrame()
+            self.logger.error(f"Error loading and preparing securities: {str(e)}", exc_info=True)
+            return None # Return None to indicate failure in error handling test
 
     def _calculate_price_movement_potential(self, df):
         """Calculate price movement potential for each security."""
         try:
-            # Check for required columns
-            required_columns = [
-                'price_momentum_50d', 'price_momentum_200d',
-                'volume_change_50d', 'volume_change_200d',
-                'Price', 'MA50', 'MA200'
-            ]
-            for col in required_columns:
-                if col not in df.columns:
-                    self.logger.warning(f"Missing column {col}, setting default value to 0.0")
-                    df[col] = 0.0
-
+            # Calculate price momentum
+            df['price_momentum_50d'] = (df['price'] - df['ma50']) / df['ma50']
+            df['price_momentum_200d'] = (df['price'] - df['ma200']) / df['ma200']
+            
+            # Calculate volume changes
+            df['volume_change_50d'] = (df['volume'] - df['volume_ma50']) / df['volume_ma50']
+            df['volume_change_200d'] = (df['volume'] - df['volume_ma200']) / df['volume_ma200']
+            
             # Calculate price action score (30%)
             df['price_momentum_score'] = (
                 df['price_momentum_50d'].abs() * 0.6 +
@@ -324,12 +385,12 @@ class InvestmentAnalyzer:
 
             # Calculate technical score (25%)
             df['ma_alignment'] = 0.0
-            df.loc[df['MA50'] > df['MA200'], 'ma_alignment'] = 1.0
-            df.loc[df['MA50'] < df['MA200'], 'ma_alignment'] = 0.0
-            df.loc[df['MA50'] == df['MA200'], 'ma_alignment'] = 0.5
+            df.loc[df['ma50'] > df['ma200'], 'ma_alignment'] = 1.0
+            df.loc[df['ma50'] < df['ma200'], 'ma_alignment'] = 0.0
+            df.loc[df['ma50'] == df['ma200'], 'ma_alignment'] = 0.5
 
-            df['price_vs_ma50'] = ((df['Price'] - df['MA50']) / df['MA50'] + 0.5).clip(0, 1)
-            df['price_vs_ma200'] = ((df['Price'] - df['MA200']) / df['MA200'] + 0.5).clip(0, 1)
+            df['price_vs_ma50'] = ((df['price'] - df['ma50']) / df['ma50'] + 0.5).clip(0, 1)
+            df['price_vs_ma200'] = ((df['price'] - df['ma200']) / df['ma200'] + 0.5).clip(0, 1)
 
             df['technical_score'] = (
                 df['ma_alignment'] * 0.4 +
@@ -338,7 +399,7 @@ class InvestmentAnalyzer:
             ) * 0.25
 
             # Calculate market context score (20%)
-            df['market_score'] = 0.5 * 0.2  # Default to neutral market score
+            df['market_score'] = df['beta'].apply(lambda x: min(max((x + 0.5) / 2.0, 0), 1)) * 0.2
 
             # Calculate final score
             df['price_movement_potential'] = (
@@ -352,143 +413,171 @@ class InvestmentAnalyzer:
             df['price_movement_potential'] = df['price_movement_potential'].clip(0, 1)
 
             return df
-                
+            
         except Exception as e:
             self.logger.error(f"Error calculating price movement potential: {str(e)}")
             df['price_movement_potential'] = 0.0
             return df
     
-    def identify_potential_movers(self) -> pd.DataFrame:
+    def identify_potential_movers(self, df) -> pd.DataFrame:
         """
         Identify securities with high potential for significant price movement.
+        Selects top N based on score, where N is at least 10% of input.
             
         Returns:
-            pd.DataFrame: Securities with high movement potential.
+            pd.DataFrame: Top N securities sorted by movement potential.
         """
         try:
-            # Load and prepare securities data
-            df = self.load_and_prepare_securities()
-            if df.empty:
-                self.logger.warning("No securities data available")
-                return pd.DataFrame()
-            
-            # Calculate price movement potential for all securities
-            df = self._calculate_price_movement_potential(df)
+            if df is None or df.empty:
+                 self.logger.warning("Input DataFrame is empty for identifying potential movers.")
+                 return pd.DataFrame()
+                 
+            # Ensure the score column exists
+            if 'price_movement_potential' not in df.columns:
+                 self.logger.error("'price_movement_potential' column missing, cannot identify movers.")
+                 # Calculate it if missing - ensure _calculate_price_movement_potential is robust
+                 df = self._calculate_price_movement_potential(df)
+                 if 'price_movement_potential' not in df.columns:
+                      return pd.DataFrame() # Return empty if calculation failed
             
             # Log score distribution
             score_stats = df['price_movement_potential'].describe()
-            self.logger.info(f"Price movement potential score distribution:\n{score_stats}")
+            self.logger.info(f"Price movement potential score distribution (before top N selection):\n{score_stats}")
             
-            # Filter securities with high movement potential
-            threshold = 0.5  # Threshold for significant movement potential
-            potential_movers = df[df['price_movement_potential'] > threshold].copy()
+            # Determine number of securities to select (at least 10% or a minimum like 35)
+            initial_count = len(df)
+            min_required = 35 # Set a minimum number regardless of percentage
+            top_n = max(min_required, int(0.1 * initial_count))
+            self.logger.info(f"Selecting top {top_n} potential movers from {initial_count} candidates.")
+
+            # Sort by movement potential (descending) and select top N
+            potential_movers = df.sort_values('price_movement_potential', ascending=False).head(top_n).copy()
             
             if potential_movers.empty:
-                self.logger.warning(f"No securities found with movement potential > {threshold}")
-                # Return the original DataFrame instead of an empty one
-                df['analysis_timestamp'] = pd.Timestamp.now()
-                return df
-            
-            # Sort by movement potential (descending)
-            potential_movers = potential_movers.sort_values('price_movement_potential', ascending=False)
+                self.logger.warning(f"No potential movers identified after sorting and selection.")
+                return pd.DataFrame()
             
             # Add analysis timestamp
             potential_movers['analysis_timestamp'] = pd.Timestamp.now()
             
+            self.logger.info(f"Identified {len(potential_movers)} securities with high movement potential")
             return potential_movers
             
         except Exception as e:
-            self.logger.error(f"Error identifying potential movers: {str(e)}")
+            self.logger.error(f"Error identifying potential movers: {str(e)}", exc_info=True)
             return pd.DataFrame()
 
-    def save_potential_securities(self, securities: List[Dict]) -> bool:
-        """Save the list of high-potential securities to a JSON file.
-
-        Args:
-            securities (List[Dict]): List of dictionaries containing security data.
-
-        Returns:
-            bool: True if save was successful, False otherwise.
-        """
-        try:
-            if not securities:
-                self.logger.warning("No securities data provided.")
-                return False
-
-            valid_securities = []
-            for security in securities:
-                try:
-                    # Ensure required fields exist and are valid
-                    if not all(key in security for key in ['Symbol', 'Price', 'Volume', 'movement_potential_score']):
-                        continue
-                    
-                    # Convert numeric fields
-                    security['Price'] = float(security['Price'])
-                    security['Volume'] = float(security['Volume'])
-                    security['movement_potential_score'] = float(security['movement_potential_score'])
-                    valid_securities.append(security)
-                except (ValueError, TypeError, KeyError) as e:
-                    self.logger.warning(f"Invalid security data: {str(e)}")
+    def _process_and_store_potential_movers(self, potential_movers_df: pd.DataFrame):
+        """Fetches details, calculates indicators, and stores results for potential movers."""
+        stored_count = 0
+        for ticker in potential_movers_df['ticker']:
+            try:
+                # Fetch necessary data (historical mainly for tech indicators)
+                yf_data = self._fetch_yf_data(ticker)
+                if yf_data is None or yf_data['history'].empty:
+                    self.logger.warning(f"Skipping DB store for {ticker}: Missing historical data.")
                     continue
 
-            if not valid_securities:
-                self.logger.warning("No valid securities data to save.")
-                return False
+                # Calculate technical indicators using fetched historical data
+                tech_indicators = self._calculate_technical_indicators(yf_data['history'])
+                if tech_indicators is None:
+                     self.logger.warning(f"Skipping DB store for {ticker}: Failed tech indicator calculation.")
+                     continue
 
-            # Create output directory if it doesn't exist
-            os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
+                # Get the pre-calculated potential score and component scores
+                row = potential_movers_df[potential_movers_df['ticker'] == ticker].iloc[0]
+                opportunity_score = row['price_movement_potential']
+                component_scores = {
+                     'price_action_score': row.get('price_action_score', 0.0),
+                     'volume_score': row.get('volume_score', 0.0),
+                     'technical_score': row.get('technical_score', 0.0),
+                     'market_score': row.get('market_score', 0.0)
+                }
+                final_metrics = {**tech_indicators, **component_scores} 
 
-            # Save to JSON file
-            data = {
-                'analysis_timestamp': get_current_time(),
-                'high_potential_securities': valid_securities
-            }
+                # Store analysis result in DB
+                success = self.db.insert_analysis_result(
+                    ticker=ticker,
+                    analysis_type='investment_opportunity',
+                    score=opportunity_score,
+                    metrics=final_metrics
+                )
+                if success:
+                    stored_count += 1
+                else:
+                    self.logger.error(f"Failed to store investment analysis result for {ticker} in DB.")
+                    
+            except Exception as ticker_error:
+                 self.logger.error(f"Error processing/storing investment data for ticker {ticker}: {ticker_error}", exc_info=True)
+                 continue # Move to the next ticker
+        self.logger.info(f"Stored investment analysis results for {stored_count}/{len(potential_movers_df)} potential tickers.")
+
+    def run_analysis(self) -> List[str]: # Return list of tickers
+        """Run the investment analysis: Load, Prepare, Score, Identify Top N, Store & Return Tickers."""
+        try:
+            # Load and prepare securities data from DB
+            prepared_df = self.load_and_prepare_securities()
+            if prepared_df is None or prepared_df.empty: 
+                self.logger.error("Failed to load or prepare securities data.")
+                return [] # Return empty list on failure
             
-            save_to_json(data, self.output_file)
-            self.logger.info(f"Saved {len(valid_securities)} high-potential securities to {self.output_file}")
-            return True
+            # Track the total number of securities in the source file
+            initial_count = len(prepared_df)
+            min_required = max(35, int(0.1 * initial_count))
+            
+            # Identify top N potential movers (includes score calculation)
+            potential_movers_df = self.identify_potential_movers(prepared_df)
+            
+            if potential_movers_df.empty:
+                self.logger.info("No potential movers identified after filtering.")
+                return []
 
+            # Process details and store results for the identified movers
+            self._process_and_store_potential_movers(potential_movers_df)
+            
+            # Get the list of identified potential tickers
+            potential_tickers = potential_movers_df['ticker'].tolist()
+            self.logger.info(f"Investment analysis found {len(potential_tickers)} potential tickers for next stage.")
+            
+            # Check if we meet the minimum threshold requirement
+            if len(potential_tickers) < min_required:
+                self.logger.warning(f"Identified tickers ({len(potential_tickers)}) are below the minimum threshold of 10% ({min_required}).")
+                # Add a special element at the beginning of the list to indicate threshold not met
+                message = f"THRESHOLD_NOT_MET: Only identified {len(potential_tickers)} potential tickers, which is below the required minimum of {min_required} (10% of {initial_count} total securities)."
+                return [message] + potential_tickers
+            
+            return potential_tickers
+            
         except Exception as e:
-            self.logger.error(f"Error saving potential securities: {str(e)}")
-            return False
-
-    def run_analysis(self) -> bool:
-        """Main entry point to run the full analysis and save results."""
-        self.logger.info("Starting Investment Analyzer: Identifying high price movement potential securities.")
-        potential_movers = self.identify_potential_movers()
-        
-        if potential_movers.empty:
-             self.logger.warning("Investment Analysis did not identify any securities.")
-             return False
-             
-        success = self.save_potential_securities(potential_movers.to_dict('records'))
-        
-        if success:
-            self.logger.info("Investment Analyzer finished successfully.")
-        else:
-            self.logger.error("Investment Analyzer finished with errors during saving.")
-            
-        return success
+            self.logger.error(f"Error running investment analysis: {str(e)}", exc_info=True)
+            return [] # Return empty list on failure
 
     def _calculate_opportunity_score(self, metrics: Dict) -> float:
-        """Calculate the overall opportunity score from individual metrics."""
+        """Calculate the overall opportunity score from individual metrics provided in the metrics dict."""
         try:
-            # Ensure all required metrics exist with valid values
-            required_metrics = ['momentum_score', 'volume_score', 'technical_score', 'market_score']
-            for metric in required_metrics:
-                if metric not in metrics or not isinstance(metrics[metric], (int, float)) or pd.isna(metrics[metric]):
-                    metrics[metric] = 0.0
-                metrics[metric] = max(0.0, min(1.0, float(metrics[metric])))  # Clamp between 0 and 1
-            
-            # Calculate weighted score
-            weights = {
-                'momentum_score': 0.3,    # Price momentum (30%)
-                'volume_score': 0.25,     # Volume analysis (25%)
-                'technical_score': 0.25,  # Technical indicators (25%)
-                'market_score': 0.2       # Market context (20%)
+            # Use the component score names as calculated in _calculate_price_movement_potential
+            required_components = {
+                'price_action_score': 0.0, # Correct key
+                'volume_score': 0.0,
+                'technical_score': 0.0,
+                'market_score': 0.0
             }
             
-            total_score = sum(weights[metric] * metrics[metric] for metric in required_metrics)
+            # Validate and clamp component scores from the input metrics
+            validated_metrics = {}
+            for component, default_value in required_components.items():
+                 value = metrics.get(component, default_value)
+                 if not isinstance(value, (int, float)) or pd.isna(value):
+                     validated_metrics[component] = default_value
+            else:
+                     validated_metrics[component] = max(0.0, float(value)) 
+            
+            # The final score is simply the sum of the validated component scores
+            total_score = sum(validated_metrics.values())
+            
+            # Clamp final score between 0 and 1
+            total_score = max(0.0, min(1.0, total_score))
+            
             return round(total_score, 3)
             
         except Exception as e:
@@ -498,7 +587,8 @@ class InvestmentAnalyzer:
 # Example Usage (Optional - useful for testing this module directly)
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    analyzer = InvestmentAnalyzer()
+    db = DatabaseManager()
+    analyzer = InvestmentAnalyzer(db)
     analyzer.run_analysis()
 
 # --- Removed Methods ---

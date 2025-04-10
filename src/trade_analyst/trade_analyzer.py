@@ -62,6 +62,9 @@ from ta.momentum import RSIIndicator, StochasticOscillator, WilliamsRIndicator
 from ta.volume import OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 import traceback
+from src.database import DatabaseManager
+from .rate_limiter import RateLimiter
+import json
 
 class TradeAnalyzer:
     """
@@ -74,13 +77,15 @@ class TradeAnalyzer:
     - Risk management for swing trades
     """
 
-    def __init__(self):
+    def __init__(self, db: DatabaseManager):
         """Initialize the TradeAnalyzer with swing trading parameters."""
         self.logger = setup_logging('trade_analyzer')
         self.data_dir = 'data'
         self.output_dir = 'output'
         self.input_file = os.path.join(self.data_dir, 'risk_scored_securities.json')
         self.output_file = os.path.join(self.output_dir, 'Trade_Recommendations_latest.csv')
+        self.db = db
+        self.rate_limiter = RateLimiter(calls_per_second=2.0, max_retries=3, retry_delay=5.0)
 
         # Ensure output directory exists
         os.makedirs(self.output_dir, exist_ok=True)
@@ -126,12 +131,13 @@ class TradeAnalyzer:
                 df = df.tail(days_needed)
             
             # Ensure columns are standard and add derived columns
-            df.columns = [col.capitalize() for col in df.columns]
-            df['HL_Range'] = df['High'] - df['Low']
-            df['OC_Range'] = df['Close'] - df['Open']
-            df['Body_Size'] = abs(df['OC_Range'])
-            df['Upper_Shadow'] = df['High'] - df[['Open', 'Close']].max(axis=1)
-            df['Lower_Shadow'] = df[['Open', 'Close']].min(axis=1) - df['Low']
+            # Force columns to lowercase after fetching from yfinance
+            df.columns = [col.lower() for col in df.columns] 
+            df['hl_range'] = df['high'] - df['low']
+            df['oc_range'] = df['close'] - df['open']
+            df['body_size'] = abs(df['oc_range'])
+            df['upper_shadow'] = df['high'] - df[['open', 'close']].max(axis=1)
+            df['lower_shadow'] = df[['open', 'close']].min(axis=1) - df['low']
             
             # Calculate swing highs and lows
             df = self._calculate_swing_points(df)
@@ -144,20 +150,21 @@ class TradeAnalyzer:
             
     def _calculate_swing_points(self, df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
         """Identifies swing highs and lows in the price data."""
-        df['Swing_High'] = False
-        df['Swing_Low'] = False
+        # Ensure columns are lowercase
+        df['swing_high'] = False 
+        df['swing_low'] = False
         
         # Find local maxima and minima
         for i in range(window, len(df) - window):
             # Check for swing high
-            if all(df['High'].iloc[i] > df['High'].iloc[i-j] for j in range(1, window+1)) and \
-               all(df['High'].iloc[i] > df['High'].iloc[i+j] for j in range(1, window+1)):
-                df.loc[df.index[i], 'Swing_High'] = True
+            if all(df['high'].iloc[i] > df['high'].iloc[i-j] for j in range(1, window+1)) and \
+               all(df['high'].iloc[i] > df['high'].iloc[i+j] for j in range(1, window+1)):
+                df.loc[df.index[i], 'swing_high'] = True
                 
             # Check for swing low
-            if all(df['Low'].iloc[i] < df['Low'].iloc[i-j] for j in range(1, window+1)) and \
-               all(df['Low'].iloc[i] < df['Low'].iloc[i+j] for j in range(1, window+1)):
-                df.loc[df.index[i], 'Swing_Low'] = True
+            if all(df['low'].iloc[i] < df['low'].iloc[i-j] for j in range(1, window+1)) and \
+               all(df['low'].iloc[i] < df['low'].iloc[i+j] for j in range(1, window+1)):
+                df.loc[df.index[i], 'swing_low'] = True
                 
         return df
 
@@ -171,8 +178,14 @@ class TradeAnalyzer:
         try:
             indicators = {}
             
+            # Ensure required columns exist and are lowercase
+            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            if not all(col in df.columns for col in required_cols):
+                 self.logger.error(f"Missing required columns in historical data: {required_cols}")
+                 return None
+
             # Clean and prepare data
-            df.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], inplace=True)
+            df.dropna(subset=required_cols, inplace=True)
             if df.empty:
                 return None
                 
@@ -183,6 +196,8 @@ class TradeAnalyzer:
                 'medium': min(10, data_len - 1),
                 'long': min(20, data_len - 1)
             }
+            
+            # --- Calculations using lowercase column names --- 
             
             # Trend Indicators
             indicators.update(self._calculate_trend_indicators(df, windows))
@@ -200,9 +215,18 @@ class TradeAnalyzer:
             indicators.update(self._analyze_swings(df))
             
             # Add current price and recent trend
-            indicators['current_price'] = float(df['Close'].iloc[-1])
+            indicators['current_price'] = float(df['close'].iloc[-1])
             indicators['recent_trend'] = self._analyze_recent_trend(df)
             
+            # Clean up potential NaN/Inf values before returning
+            for key, value in indicators.items():
+                if isinstance(value, (float, int)) and (pd.isna(value) or np.isinf(value)):
+                    indicators[key] = 0.0 # Default to 0 if NaN or Inf
+                elif isinstance(value, dict): # Clean nested dicts like recent_trend
+                     for sub_key, sub_value in value.items():
+                         if isinstance(sub_value, (float, int)) and (pd.isna(sub_value) or np.isinf(sub_value)):
+                              value[sub_key] = 0.0
+
             return indicators
             
         except Exception as e:
@@ -216,11 +240,15 @@ class TradeAnalyzer:
         # Moving Averages
         for period in [5, 10, 20, 50, 200]:
             window = min(period, windows['long'])
-            indicators[f'sma_{period}'] = ta.trend.sma_indicator(df['Close'], window=window).iloc[-1]
-            indicators[f'ema_{period}'] = ta.trend.ema_indicator(df['Close'], window=window).iloc[-1]
+            if window > 0:
+                indicators[f'sma_{period}'] = ta.trend.sma_indicator(df['close'], window=window).iloc[-1]
+                indicators[f'ema_{period}'] = ta.trend.ema_indicator(df['close'], window=window).iloc[-1]
+            else:
+                indicators[f'sma_{period}'] = 0.0
+                indicators[f'ema_{period}'] = 0.0
         
         # MACD
-        macd = ta.trend.MACD(df['Close'], 
+        macd = ta.trend.MACD(df['close'], 
                             window_slow=min(26, windows['medium']),
                             window_fast=min(12, windows['medium']),
                             window_sign=min(9, windows['medium']))
@@ -229,7 +257,7 @@ class TradeAnalyzer:
         indicators['macd_hist'] = macd.macd_diff().iloc[-1]
         
         # ADX
-        adx = ADXIndicator(df['High'], df['Low'], df['Close'], window=min(14, windows['medium']))
+        adx = ADXIndicator(df['high'], df['low'], df['close'], window=min(14, windows['medium']))
         indicators['adx'] = adx.adx().iloc[-1]
         indicators['+di'] = adx.adx_pos().iloc[-1]
         indicators['-di'] = adx.adx_neg().iloc[-1]
@@ -241,18 +269,18 @@ class TradeAnalyzer:
         indicators = {}
         
         # RSI
-        rsi = RSIIndicator(df['Close'], window=min(14, windows['medium']))
+        rsi = RSIIndicator(df['close'], window=min(14, windows['medium']))
         indicators['rsi'] = rsi.rsi().iloc[-1]
         
         # Stochastic
-        stoch = StochasticOscillator(df['High'], df['Low'], df['Close'],
+        stoch = StochasticOscillator(df['high'], df['low'], df['close'],
                                    window=min(14, windows['medium']),
                                    smooth_window=min(3, windows['short']))
         indicators['stoch_k'] = stoch.stoch().iloc[-1]
         indicators['stoch_d'] = stoch.stoch_signal().iloc[-1]
         
-        # Williams %R - Updated to use lbp parameter instead of window
-        willr = WilliamsRIndicator(df['High'], df['Low'], df['Close'],
+        # Williams %R
+        willr = WilliamsRIndicator(df['high'], df['low'], df['close'],
                                  lbp=min(14, windows['medium']))
         indicators['willr'] = willr.williams_r().iloc[-1]
         
@@ -263,16 +291,20 @@ class TradeAnalyzer:
         indicators = {}
         
         # OBV
-        obv = OnBalanceVolumeIndicator(df['Close'], df['Volume'])
+        obv = OnBalanceVolumeIndicator(df['close'], df['volume'])
         indicators['obv'] = obv.on_balance_volume().iloc[-1]
         
         # CMF
-        cmf = ChaikinMoneyFlowIndicator(df['High'], df['Low'], df['Close'], df['Volume'],
+        cmf = ChaikinMoneyFlowIndicator(df['high'], df['low'], df['close'], df['volume'],
                                       window=min(20, windows['short']))
         indicators['cmf'] = cmf.chaikin_money_flow().iloc[-1]
         
         # Volume SMA
-        indicators['volume_sma_20'] = ta.trend.sma_indicator(df['Volume'], window=20).iloc[-1]
+        vol_window = min(20, windows['long'])
+        if vol_window > 0:
+             indicators['volume_sma_20'] = ta.trend.sma_indicator(df['volume'], window=vol_window).iloc[-1]
+        else:
+             indicators['volume_sma_20'] = 0.0
         
         return indicators
 
@@ -281,17 +313,27 @@ class TradeAnalyzer:
         indicators = {}
         
         # Bollinger Bands
-        bb = BollingerBands(df['Close'], window=min(20, windows['short']))
-        indicators['bb_upper'] = bb.bollinger_hband().iloc[-1]
-        indicators['bb_middle'] = bb.bollinger_mavg().iloc[-1]
-        indicators['bb_lower'] = bb.bollinger_lband().iloc[-1]
-        indicators['bb_width'] = bb.bollinger_wband().iloc[-1]
+        bb_window = min(20, windows['short'])
+        if bb_window > 0:
+            bb = BollingerBands(df['close'], window=bb_window)
+            indicators['bb_upper'] = bb.bollinger_hband().iloc[-1]
+            indicators['bb_middle'] = bb.bollinger_mavg().iloc[-1]
+            indicators['bb_lower'] = bb.bollinger_lband().iloc[-1]
+            indicators['bb_width'] = bb.bollinger_wband().iloc[-1]
+        else:
+            indicators['bb_upper'] = 0.0
+            indicators['bb_middle'] = 0.0
+            indicators['bb_lower'] = 0.0
+            indicators['bb_width'] = 0.0
         
         # ATR
-        atr = AverageTrueRange(df['High'], df['Low'], df['Close'],
-                             window=min(14, windows['short']))
-        indicators['atr'] = atr.average_true_range().iloc[-1]
-        
+        atr_window = min(14, windows['short'])
+        if atr_window > 0:
+            atr = AverageTrueRange(df['high'], df['low'], df['close'], window=atr_window)
+            indicators['atr'] = atr.average_true_range().iloc[-1]
+        else:
+            indicators['atr'] = 0.0
+            
         return indicators
 
     def _analyze_swings(self, df: pd.DataFrame) -> Dict[str, Any]:
@@ -307,29 +349,30 @@ class TradeAnalyzer:
         try:
             # Calculate swing points
             window = 5  # Window size for swing detection
-            df['Swing_High'] = False
-            df['Swing_Low'] = False
+            # Use lowercase for new columns
+            df['swing_high'] = False 
+            df['swing_low'] = False
             
             for i in range(window, len(df) - window):
-                # Check for swing high
-                if all(df['High'].iloc[i] > df['High'].iloc[i-window:i]) and \
-                   all(df['High'].iloc[i] > df['High'].iloc[i+1:i+window+1]):
-                    df.loc[df.index[i], 'Swing_High'] = True
+                # Check for swing high (use lowercase 'high')
+                if all(df['high'].iloc[i] > df['high'].iloc[i-window:i]) and \
+                   all(df['high'].iloc[i] > df['high'].iloc[i+1:i+window+1]):
+                    df.loc[df.index[i], 'swing_high'] = True
                 
-                # Check for swing low
-                if all(df['Low'].iloc[i] < df['Low'].iloc[i-window:i]) and \
-                   all(df['Low'].iloc[i] < df['Low'].iloc[i+1:i+window+1]):
-                    df.loc[df.index[i], 'Swing_Low'] = True
+                # Check for swing low (use lowercase 'low')
+                if all(df['low'].iloc[i] < df['low'].iloc[i-window:i]) and \
+                   all(df['low'].iloc[i] < df['low'].iloc[i+1:i+window+1]):
+                    df.loc[df.index[i], 'swing_low'] = True
             
-            # Get recent swing points
-            recent_highs = df[df['Swing_High']].tail(3)
-            recent_lows = df[df['Swing_Low']].tail(3)
+            # Get recent swing points (use lowercase)
+            recent_highs = df[df['swing_high']].tail(3)
+            recent_lows = df[df['swing_low']].tail(3)
             
             if not recent_highs.empty:
-                analysis['swing_highs'] = recent_highs['High'].tolist()
+                analysis['swing_highs'] = recent_highs['high'].tolist()
             
             if not recent_lows.empty:
-                analysis['swing_lows'] = recent_lows['Low'].tolist()
+                analysis['swing_lows'] = recent_lows['low'].tolist()
             
             # Calculate trend channel if we have enough swing points
             if len(analysis['swing_highs']) >= 2 and len(analysis['swing_lows']) >= 2:
@@ -376,9 +419,9 @@ class TradeAnalyzer:
         }
         
         # Calculate trend strength
-        highs = recent['High'].values
-        lows = recent['Low'].values
-        closes = recent['Close'].values
+        highs = recent['high'].values
+        lows = recent['low'].values
+        closes = recent['close'].values
         
         # Check for higher highs and higher lows (uptrend)
         if all(highs[i] > highs[i-1] for i in range(1, len(highs))) and \
@@ -395,12 +438,13 @@ class TradeAnalyzer:
         # Analyze candlestick patterns
         for i in range(len(recent)):
             candle = recent.iloc[i]
-            if candle['Body_Size'] > 0:  # Not a doji
-                if candle['OC_Range'] > 0:  # Bullish candle
-                    if candle['Lower_Shadow'] > 2 * candle['Body_Size']:
+            # Ensure calculated columns exist and are lowercase
+            if 'body_size' in candle and candle['body_size'] > 0:  # Not a doji
+                if 'oc_range' in candle and candle['oc_range'] > 0:  # Bullish candle
+                    if 'lower_shadow' in candle and candle['lower_shadow'] > 2 * candle['body_size']:
                         analysis['price_action'].append('hammer')
-                else:  # Bearish candle
-                    if candle['Upper_Shadow'] > 2 * candle['Body_Size']:
+                elif 'oc_range' in candle:  # Bearish candle
+                    if 'upper_shadow' in candle and candle['upper_shadow'] > 2 * candle['body_size']:
                         analysis['price_action'].append('shooting_star')
                         
         return analysis
@@ -508,156 +552,124 @@ class TradeAnalyzer:
 
         return signal, strongest_timeframe, final_justification
 
-    def generate_trade_signals(self) -> bool:
-        """Generate swing trading signals for all securities."""
+    def generate_trade_signals(self, tickers: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Generate trading signals for the provided list of tickers."""
+        self.logger.info(f"Starting trade signal generation for {len(tickers)} tickers...")
+        trade_results = {}
+        if not tickers:
+            self.logger.warning("No tickers provided for trade signal generation.")
+            return {}
+
         try:
-            # Load risk-scored securities
-            data = load_from_json(self.input_file)
-            if not data or 'risk_scored_securities' not in data:
-                self.logger.error("No securities data found or invalid format")
-                return False
-
-            securities = data['risk_scored_securities']
-            if not securities:
-                self.logger.error("No securities in the list")
-                return False
-
-            recommendations = []
-            for security in securities:
-                ticker = security.get('Symbol') or security.get('symbol')  # Try both cases
-                if not ticker:
-                    self.logger.warning(f"Missing symbol in security data: {security}")
-                    continue
-                
-                # Fetch data for multiple timeframes
-                data = {}
-                for timeframe, (period, interval) in self.timeframes.items():
-                    df = self._get_stock_data(ticker, period=f"{period}d", interval=interval)
-                    if df is not None:
-                        data[timeframe] = df
-
-                if not data:
-                    self.logger.warning(f"No data available for {ticker}")
-                    continue
-
-                # Calculate indicators for each timeframe
-                indicators = {}
-                for timeframe, df in data.items():
-                    timeframe_indicators = self._calculate_technical_indicators(df)
-                    if timeframe_indicators:
-                        indicators[timeframe] = timeframe_indicators
-
-                if not indicators:
-                    continue
-
-                # Determine signal for each timeframe
-                signals = {}
-                for timeframe, timeframe_indicators in indicators.items():
-                    signal, timeframe, justification = self._determine_signal_and_timeframe(timeframe_indicators)
-                    signals[timeframe] = {
-                        'signal': signal,
-                        'timeframe': timeframe,
-                        'justification': justification
-                    }
-
-                # Determine strongest signal
-                strongest_signal = max(signals.items(), 
-                                    key=lambda x: abs(self.signal_thresholds['strong'] if x[1]['signal'] != 'HOLD' else 0))
-
-                # Add recommendation
-                recommendations.append({
-                    'ticker': ticker,
-                    'name': security['name'],
-                    'signal': strongest_signal[1]['signal'],
-                    'timeframe': strongest_signal[1]['timeframe'],
-                    'confidence': strongest_signal[1]['justification'][0].split()[0],
-                    'price': indicators[strongest_signal[0]]['current_price'],
-                    'position_size': indicators[strongest_signal[0]].get('position_size', 0.05),
-                    'justification': strongest_signal[1]['justification']
-                })
-
-            # Save recommendations
-            if recommendations:
-                df = pd.DataFrame(recommendations)
-                df.to_csv(self.output_file, index=False)
-                self.logger.info(f"Saved {len(recommendations)} swing trading recommendations to {self.output_file}")
-                return True
-            else:
-                self.logger.warning("No swing trading recommendations generated")
-                return False
-
+            # Fetch necessary data only for the provided tickers
+            # Optimize by fetching all securities info once if needed? 
+            # Current implementation fetches per ticker.
+            
+            for ticker in tickers:
+                try:
+                    # Get security info (might be needed for _generate_signals)
+                    security = self.db.get_security(ticker)
+                    if not security:
+                         self.logger.warning(f"Skipping {ticker}: Could not retrieve security info.")
+                         continue
+                         
+                    # Get historical data
+                    historical_data = self.db.get_historical_data(ticker)
+                    if historical_data is None or historical_data.empty:
+                        self.logger.warning(f"Skipping {ticker}: No historical data found.")
+                        continue
+                    
+                    # Get latest analysis results for this specific ticker
+                    investment_analysis = self.db.get_latest_analysis(ticker, 'investment_opportunity')
+                    risk_analysis = self.db.get_latest_analysis(ticker, 'risk')
+                    
+                    # Check if BOTH required analysis results exist for this ticker
+                    if not investment_analysis or not risk_analysis:
+                        self.logger.warning(f"Skipping {ticker}: Missing required investment or risk analysis results.")
+                        continue
+                    
+                    # Generate trading signals using all gathered data
+                    signals = self._generate_signals(security, historical_data, 
+                                                  investment_analysis, risk_analysis)
+                    
+                    # Store trade analysis result in DB
+                    success = self.db.insert_analysis_result(
+                        ticker=ticker,
+                        analysis_type='trade',
+                        score=signals.get('signal_score', 0.0), # Use signal_score
+                        metrics=signals # Store all generated signal info
+                    )
+                    if not success:
+                         self.logger.error(f"Failed to store trade analysis result for {ticker}.")
+                         
+                    # Add to results dict regardless of DB storage success?
+                    trade_results[ticker] = signals
+                    
+                except Exception as ticker_error:
+                    self.logger.error(f"Error analyzing ticker {ticker} for trade signal: {ticker_error}", exc_info=True)
+                    continue # Continue to the next ticker
+            
+            self.logger.info(f"Trade signal generation completed. Generated signals for {len(trade_results)}/{len(tickers)} provided tickers.")
+            return trade_results
+            
         except Exception as e:
-            self.logger.error(f"Error generating swing trading signals: {str(e)}")
-            return False
+            self.logger.error(f"Error generating trade signals: {str(e)}", exc_info=True)
+            return {}
 
-    def analyze_security(self, historical_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Analyze a single security's historical data to generate trading signals.
-        
-        Args:
-            historical_data: Dictionary containing historical price data and indicators
-            
-        Returns:
-            Dictionary containing trading signals and analysis
-        """
+    def _generate_signals(self, security: Dict[str, Any], 
+                         historical_data: pd.DataFrame,
+                         investment_analysis: Dict[str, Any],
+                         risk_analysis: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Generate trading signals for a security using comprehensive indicators."""
         try:
-            # Extract the DataFrame from historical data
-            df = historical_data.get('history')
-            if df is None or df.empty:
-                self.logger.warning("No historical data provided for analysis")
-                return None
-                
-            # Calculate technical indicators
-            indicators = self._calculate_technical_indicators(df)
-            if not indicators:
-                self.logger.warning("Failed to calculate technical indicators")
-                return None
-            
-            # Determine trading signal
+            # 1. Calculate all necessary technical indicators
+            indicators = self._calculate_technical_indicators(historical_data)
+            if indicators is None:
+                self.logger.warning(f"Skipping signal generation for {security['ticker']}: Failed indicator calculation.")
+                return None # Indicate failure to generate signals
+
+            # 2. Determine Signal, Timeframe, and Justification
             signal, timeframe, justification = self._determine_signal_and_timeframe(indicators)
             
-            # Prepare analysis results
-            analysis = {
-                'signal': signal,
-                'timeframe': timeframe,
-                'confidence': justification[0].split()[0],
-                'price': indicators['current_price'],
-                'position_size': indicators.get('position_size', 0.05),
-                'justification': justification,
-                'indicators': {
-                    'trend': {
-                        'adx': indicators['adx'],
-                        'macd': indicators['macd'],
-                        'macd_signal': indicators['macd_signal']
-                    },
-                    'momentum': {
-                        'rsi': indicators['rsi'],
-                        'stoch_k': indicators['stoch_k'],
-                        'stoch_d': indicators['stoch_d']
-                    },
-                    'volume': {
-                        'obv': indicators['obv'],
-                        'cmf': indicators['cmf']
-                    },
-                    'volatility': {
-                        'atr': indicators['atr'],
-                        'bb_width': indicators['bb_width']
-                    }
-                }
+            # 3. Calculate final signal score (incorporating investment/risk analysis)
+            #    (Keep existing logic for now, might need refinement)
+            signal_score = (
+                0.3 * investment_analysis.get('score', 0) +  
+                0.3 * (1 - risk_analysis.get('risk_score', 0)) +  
+                0.2 * (1 if signal == 'BUY' else 0 if signal == 'SELL' else 0.5) + # Use determined signal
+                0.2 * (1 if indicators.get('recent_trend', {}).get('trend_direction') == 'up' else 
+                       0 if indicators.get('recent_trend', {}).get('trend_direction') == 'down' else 0.5) # Use calculated trend
+            )
+            signal_score = max(0.0, min(1.0, signal_score)) # Clamp score
+
+            # 4. Construct the final output dictionary
+            #    Use the results from _determine_signal_and_timeframe
+            output = {
+                'signal_score': round(signal_score, 3),
+                'signal': signal, # From determine method
+                'timeframe': timeframe, # From determine method
+                'confidence': justification[0].split(' ')[0] if justification else 'NEUTRAL', # Extract confidence
+                'current_price': indicators.get('current_price', 0.0),
+                'position_size': indicators.get('position_size', 0.0), # From determine method risk calc
+                'justification': json.dumps(justification), # From determine method
+                # Optionally include key indicators for context in DB?
+                # 'rsi': indicators.get('rsi', 0.0),
+                # 'macd': indicators.get('macd', 0.0),
+                # 'trend': indicators.get('recent_trend',{}).get('trend_direction', 'neutral'),
+                'timestamp': datetime.now().isoformat()
             }
-            
-            return analysis
+            return output
             
         except Exception as e:
-            self.logger.error(f"Error analyzing security: {str(e)}")
-            self.logger.error(traceback.format_exc())
-            return None
+            self.logger.error(f"Error generating signals for {security.get('ticker', 'UNKNOWN')}: {str(e)}", exc_info=True)
+            return None # Return None on error
 
 
 # Example Usage
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    analyzer = TradeAnalyzer()
+    db = DatabaseManager()
+    analyzer = TradeAnalyzer(db)
     analyzer.generate_trade_signals()
 
 # --- Methods Removed/Replaced ---

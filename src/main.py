@@ -13,9 +13,10 @@ import traceback
 from src.investment_analyst.investment_analyzer import InvestmentAnalyzer
 from src.research_analyst.research_analyzer import ResearchAnalyzer
 from src.trade_analyst.trade_analyzer import TradeAnalyzer
-# from src.portfolio_manager.portfolio_manager import PortfolioManager # Removed for now
+from src.database import DatabaseManager
 
-from src.utils.common import setup_logging
+# Import common utility functions
+from src.utils.common import setup_logging, save_recommendations_to_csv
 # from src.utils.json_utils import load_from_json # No longer needed here
 from src.utils.logger import get_logger
 from src.utils.config import setup_environment
@@ -43,6 +44,10 @@ def setup_environment() -> bool:
         if not logger:
             return False
             
+        # Initialize database
+        db = DatabaseManager()
+        logger.info("Database initialized successfully")
+            
         logger.info("Environment setup complete.")
         return True
     except Exception as e:
@@ -51,51 +56,94 @@ def setup_environment() -> bool:
 
 def run_analysis_cycle() -> None:
     """Run a complete analysis cycle."""
+    logger = setup_logging('main')
+    if not logger:
+        return
+
     try:
-        # Get logger
-        logger = setup_logging('main')
-        if not logger:
-            return
-            
-        # Initialize analyzers
-        investment_analyzer = InvestmentAnalyzer()
-        research_analyzer = ResearchAnalyzer()
-        trade_analyzer = TradeAnalyzer()
+        # Initialize database and analyzers
+        db = DatabaseManager()
+        investment_analyzer = InvestmentAnalyzer(db)
+        research_analyzer = ResearchAnalyzer(db)
+        trade_analyzer = TradeAnalyzer(db)
         
-        # Run investment analysis with retry
-        max_retries = 3
-        retry_delay = 5  # seconds
+        # 1. Investment Analysis: Identify Top N tickers
+        logger.info("Starting Investment Analysis...")
+        potential_tickers = investment_analyzer.run_analysis()
+        if not potential_tickers:
+            logger.warning("Investment analysis did not identify any potential tickers.")
+            return
+            
+        # Check if the first element is a threshold not met message
+        threshold_message = None
+        if potential_tickers and isinstance(potential_tickers[0], str) and potential_tickers[0].startswith("THRESHOLD_NOT_MET:"):
+            threshold_message = potential_tickers[0]
+            # Remove the message from the list
+            potential_tickers = potential_tickers[1:]
+            logger.warning(threshold_message)
+            
+        logger.info(f"Investment Analysis identified {len(potential_tickers)} potential tickers.")
+
+        # 2. Research Analysis: Calculate risk for identified tickers
+        logger.info("Starting Research Analysis...")
         
-        for attempt in range(max_retries):
-            try:
-                investment_results = investment_analyzer.run_analysis()
-                if not investment_results:
-                    logger.warning("No securities passed investment analysis")
-                    return
-                break  # Success, exit retry loop
-            except Exception as e:
-                if "Rate limit" in str(e) and attempt < max_retries - 1:
-                    logger.warning(f"Rate limit exceeded, retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                    continue
-                raise  # Re-raise if not a rate limit error or last attempt
+        # If there was a threshold message, notify the Research Analyzer
+        if threshold_message:
+            logger.info("Passing threshold warning message to Research Analyzer.")
+            # We could pass this message to the Research Analyzer if needed
+            # For now, just log it and continue with the available tickers
+        
+        risk_results = research_analyzer.run_risk_analysis(potential_tickers)
+        if not risk_results:
+            logger.warning("Research analysis failed to produce risk results for identified tickers.")
+            # Continue to trade analysis? Or stop? Let's continue but trade analyzer will skip.
+            # return # Stop if research fails
+        processed_risk_tickers = list(risk_results.keys())
+        logger.info(f"Research Analysis processed {len(processed_risk_tickers)} tickers.")
             
-        # Run research analysis
-        research_results = research_analyzer.run_risk_analysis()
-        if not research_results:
-            logger.warning("No securities passed research analysis")
+        # 3. Trade Analysis: Generate signals for tickers that passed investment and research
+        logger.info("Starting Trade Analysis...")
+        # Pass the list of tickers for which risk analysis was successfully completed
+        trade_signals = trade_analyzer.generate_trade_signals(processed_risk_tickers)
+        if not trade_signals:
+            logger.warning("Trade analysis generated no recommendations.")
             return
+        logger.info(f"Trade Analysis generated {len(trade_signals)} recommendations.")
             
-        # Run trade analysis
-        trade_results = trade_analyzer.generate_trade_signals()
-        if not trade_results:
-            logger.warning("No trade recommendations generated")
-            return
+        # 4. Save Trade Recommendations to CSV
+        # Convert trade_signals dict to list of dicts for CSV saving, filtering out None values
+        recommendations = []
+        for ticker, data in trade_signals.items():
+            if data is None: # Skip if signal generation failed for this ticker
+                 continue 
+                 
+            security_info = db.get_security(ticker) # Get name
+            recommendations.append({
+                'ticker': ticker,
+                'name': security_info.get('name', 'N/A') if security_info else 'N/A',
+                'signal': data.get('signal', 'HOLD'), # Use 'signal' key now
+                'timeframe': data.get('timeframe', 'N/A'), 
+                'confidence': data.get('confidence', 'NEUTRAL'), 
+                'price': data.get('current_price', 0.0),
+                'position_size': data.get('position_size', 0.0),
+                # Justification is already JSON stringified in _generate_signals output dict
+                'justification': data.get('justification', '[]') 
+            })
             
+        if recommendations:
+             output_path = os.path.join(OUTPUT_DIR, 'Trade_Recommendations_latest.csv')
+             success = save_recommendations_to_csv(recommendations, output_path)
+             if success:
+                  logger.info(f"Successfully saved {len(recommendations)} recommendations to {output_path}")
+             else:
+                  logger.error(f"Failed to save recommendations to {output_path}")
+        else:
+             logger.info("No recommendations formatted for CSV output.")
+
         logger.info("Analysis cycle completed successfully")
     except Exception as e:
         logger.error(f"Error in analysis cycle: {str(e)}")
+        traceback.print_exc()
 
 def main():
     """Main function to run the AI Trader framework."""

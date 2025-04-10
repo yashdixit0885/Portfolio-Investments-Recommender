@@ -4,15 +4,34 @@ import pandas as pd
 import json
 from unittest.mock import patch, MagicMock
 from src.trade_analyst.trade_analyzer import TradeAnalyzer
+from src.database.db_manager import DatabaseManager
+from datetime import datetime
 
 @pytest.mark.critical
 class TestTradeAnalyzer:
     """Critical tests for the Trade Analyzer."""
     
     @pytest.fixture
-    def analyzer(self):
-        """Create an instance of TradeAnalyzer."""
-        return TradeAnalyzer()
+    def mock_db(self):
+        """Create a mock DatabaseManager."""
+        mock = MagicMock(spec=DatabaseManager)
+        mock.get_all_securities.return_value = [{'ticker': 'AAPL', 'name': 'Apple Inc'}, {'ticker': 'MSFT', 'name': 'Microsoft Corp'}]
+        # Mock get_latest_analysis to return a sample result for any ticker/type
+        mock.get_latest_analysis.return_value = {
+            'ticker': 'AAPL', # Example ticker
+            'analysis_type': 'trade_signal',
+            'score': 0.75,
+            'metrics': {'signal_score': 0.75, 'trend': 'bullish'}, # Sample metrics
+            'timestamp': datetime.now().isoformat()
+        }
+        mock.get_historical_data.return_value = pd.DataFrame({'Close': [100, 110, 105]})
+        mock.insert_analysis_result.return_value = True
+        return mock
+
+    @pytest.fixture
+    def analyzer(self, mock_db):
+        """Create an instance of TradeAnalyzer with a mock DB."""
+        return TradeAnalyzer(db=mock_db)
     
     @pytest.fixture
     def sample_risk_scored_securities(self):
@@ -34,27 +53,27 @@ class TestTradeAnalyzer:
     
     @pytest.fixture
     def mock_stock_data(self):
-        """Create mock stock data for testing."""
+        """Create mock stock data for testing - use lowercase column names."""
         dates = pd.date_range(start='2023-01-01', periods=20, freq='D')
         df = pd.DataFrame({
-            'Open': [145.0 + i for i in range(20)],
-            'High': [146.0 + i for i in range(20)],
-            'Low': [144.0 + i for i in range(20)],
-            'Close': [145.5 + i for i in range(20)],
-            'Volume': [1000000 + i*100000 for i in range(20)]
+            'open': [145.0 + i for i in range(20)],
+            'high': [146.0 + i for i in range(20)],
+            'low': [144.0 + i for i in range(20)],
+            'close': [145.5 + i for i in range(20)], # Lowercase
+            'volume': [1000000 + i*100000 for i in range(20)]
         }, index=dates)
         
-        # Add calculated columns
-        df['HL_Range'] = df['High'] - df['Low']
-        df['OC_Range'] = df['Close'] - df['Open']
-        df['Body_Size'] = abs(df['OC_Range'])
-        df['Upper_Shadow'] = df['High'] - df[['Open', 'Close']].max(axis=1)
-        df['Lower_Shadow'] = df[['Open', 'Close']].min(axis=1) - df['Low']
-        df['Swing_High'] = [False] * 20
-        df['Swing_Low'] = [False] * 20
-        df.loc[df.index[5], 'Swing_High'] = True
-        df.loc[df.index[10], 'Swing_Low'] = True
-        df.loc[df.index[15], 'Swing_High'] = True
+        # Add calculated columns (ensure consistency with lowercase)
+        df['hl_range'] = df['high'] - df['low']
+        df['oc_range'] = df['close'] - df['open']
+        df['body_size'] = abs(df['oc_range'])
+        df['upper_shadow'] = df['high'] - df[['open', 'close']].max(axis=1)
+        df['lower_shadow'] = df[['open', 'close']].min(axis=1) - df['low']
+        df['swing_high'] = [False] * 20
+        df['swing_low'] = [False] * 20
+        df.loc[df.index[5], 'swing_high'] = True
+        df.loc[df.index[10], 'swing_low'] = True
+        df.loc[df.index[15], 'swing_high'] = True
         
         return df
     
@@ -63,29 +82,31 @@ class TestTradeAnalyzer:
         with patch('yfinance.Ticker') as mock_ticker:
             # Configure the mock
             mock_ticker_instance = MagicMock()
-            mock_ticker_instance.history.return_value = mock_stock_data
+            # Ensure the mock history itself has lowercase columns
+            mock_ticker_instance.history.return_value = mock_stock_data 
             mock_ticker.return_value = mock_ticker_instance
             
             # Call the method
             result = analyzer._get_stock_data('AAPL', period='20d')
             
-            # Check the result
+            # Check the result (should be lowercase)
             assert isinstance(result, pd.DataFrame)
             assert not result.empty
-            assert 'Close' in result.columns
-            assert 'Volume' in result.columns
-            assert 'HL_Range' in result.columns
-            assert 'OC_Range' in result.columns
-            assert 'Body_Size' in result.columns
-            assert 'Upper_Shadow' in result.columns
-            assert 'Lower_Shadow' in result.columns
-            assert 'Swing_High' in result.columns
-            assert 'Swing_Low' in result.columns
+            assert 'close' in result.columns # Expect lowercase
+            assert 'volume' in result.columns
+            # Check calculated columns are also lowercase
+            assert 'hl_range' in result.columns 
+            assert 'oc_range' in result.columns
+            assert 'body_size' in result.columns
+            assert 'upper_shadow' in result.columns
+            assert 'lower_shadow' in result.columns
+            assert 'swing_high' in result.columns
+            assert 'swing_low' in result.columns
     
     def test_calculate_technical_indicators(self, analyzer, mock_stock_data):
         """Test the _calculate_technical_indicators method."""
-        # Call the method
-        result = analyzer._calculate_technical_indicators(mock_stock_data)
+        # Call the method with lowercase data
+        result = analyzer._calculate_technical_indicators(mock_stock_data) 
         
         # Check the result
         assert isinstance(result, dict)
@@ -137,7 +158,7 @@ class TestTradeAnalyzer:
     
     def test_analyze_swings(self, analyzer, mock_stock_data):
         """Test the _analyze_swings method."""
-        # Call the method
+        # Call the method with lowercase data
         result = analyzer._analyze_swings(mock_stock_data)
         
         # Check the result
@@ -150,7 +171,7 @@ class TestTradeAnalyzer:
         assert isinstance(result['trend_channel'], dict)
         
         # If there are enough swing points, check trend channel details
-        if len(mock_stock_data[mock_stock_data['Swing_High']]) >= 2 and len(mock_stock_data[mock_stock_data['Swing_Low']]) >= 2:
+        if len(mock_stock_data[mock_stock_data['swing_high']]) >= 2 and len(mock_stock_data[mock_stock_data['swing_low']]) >= 2:
             assert 'upper_slope' in result['trend_channel']
             assert 'lower_slope' in result['trend_channel']
             assert 'is_uptrend' in result['trend_channel']
@@ -162,7 +183,7 @@ class TestTradeAnalyzer:
     
     def test_analyze_recent_trend(self, analyzer, mock_stock_data):
         """Test the _analyze_recent_trend method."""
-        # Call the method
+        # Call the method with lowercase data
         result = analyzer._analyze_recent_trend(mock_stock_data)
         
         # Check the result
@@ -223,38 +244,61 @@ class TestTradeAnalyzer:
         analyzer.input_file = str(input_file)
         analyzer.output_file = str(output_file)
         
-        # Mock the _get_stock_data method
-        mock_stock_data = pd.DataFrame({
-            'Open': [145.0 + i for i in range(20)],
-            'High': [146.0 + i for i in range(20)],
-            'Low': [144.0 + i for i in range(20)],
-            'Close': [145.5 + i for i in range(20)],
-            'Volume': [1000000 + i*100000 for i in range(20)],
-            'HL_Range': [2.0] * 20,
-            'OC_Range': [0.5] * 20,
-            'Body_Size': [0.5] * 20,
-            'Upper_Shadow': [0.5] * 20,
-            'Lower_Shadow': [0.5] * 20,
-            'Swing_High': [False] * 20,
-            'Swing_Low': [False] * 20
-        })
+        # Mock the database returns
+        mock_security = {'ticker': 'AAPL', 'name': 'Apple Inc', 'price': 150.0}
+        analyzer.db.get_security.return_value = mock_security
         
-        with patch.object(analyzer, '_get_stock_data', return_value=mock_stock_data):
-            # Call the method
-            result = analyzer.generate_trade_signals()
+        # Mock historical data
+        mock_historical_data = pd.DataFrame({
+            'open': [145.0 + i for i in range(20)],
+            'high': [146.0 + i for i in range(20)],
+            'low': [144.0 + i for i in range(20)],
+            'close': [145.5 + i for i in range(20)], 
+            'volume': [1000000 + i*100000 for i in range(20)]
+        })
+        analyzer.db.get_historical_data.return_value = mock_historical_data
+        
+        # Mock analysis results
+        mock_investment_analysis = {
+            'score': 0.75,
+            'metrics': {'trend': 'bullish', 'momentum': 'positive'}
+        }
+        mock_risk_analysis = {
+            'risk_score': 0.3,
+            'metrics': {'volatility': 0.2, 'beta': 1.1}
+        }
+        analyzer.db.get_latest_analysis.side_effect = lambda ticker, analysis_type: \
+            mock_investment_analysis if analysis_type == 'investment_opportunity' else mock_risk_analysis
+        
+        # Mock successful DB insertion
+        analyzer.db.insert_analysis_result.return_value = True
+        
+        # Create list of tickers to pass to the method
+        tickers = ['AAPL', 'MSFT']
+        
+        # Mock the _generate_signals method to return a valid signal dictionary
+        mock_signal = {
+            'signal_score': 0.8,
+            'signal': 'BUY',
+            'timeframe': 'MEDIUM',
+            'confidence': 'HIGH',
+            'current_price': 155.0,
+            'position_size': 1000,
+            'justification': json.dumps(['HIGH confidence: Strong uptrend detected'])
+        }
+        with patch.object(analyzer, '_generate_signals', return_value=mock_signal):
+            # Call the method with tickers
+            result = analyzer.generate_trade_signals(tickers)
             
-            # Check the result
-            assert result is True
-            assert output_file.exists()
+            # Check the result - should be a dictionary of signals
+            assert isinstance(result, dict)
+            assert 'AAPL' in result
+            assert 'MSFT' in result
+            assert result['AAPL']['signal_score'] == 0.8
+            assert result['AAPL']['signal'] == 'BUY'
             
-            # Check the content of the file
-            df = pd.read_csv(output_file)
-            assert not df.empty
-            assert 'ticker' in df.columns
-            assert 'name' in df.columns
-            assert 'signal' in df.columns
-            assert 'timeframe' in df.columns
-            assert 'confidence' in df.columns
-            assert 'price' in df.columns
-            assert 'position_size' in df.columns
-            assert 'justification' in df.columns 
+            # Verify DB calls were made
+            assert analyzer.db.get_security.call_count == 2
+            assert analyzer.db.get_historical_data.call_count == 2
+            assert analyzer.db.get_latest_analysis.call_count == 4  # 2 tickers * 2 analysis types
+            assert analyzer.db.insert_analysis_result.call_count == 2 
