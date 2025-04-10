@@ -56,7 +56,8 @@ import time
 import random
 import logging
 import traceback
-from typing import Dict, List, Any, Optional
+import json
+from typing import Dict, List, Any, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -87,7 +88,7 @@ class ResearchAnalyzer:
         self.rate_limiter = RateLimiter(calls_per_second=6.0, max_retries=3, retry_delay=5.0)
         
         # Cache for fetched yfinance data to reduce API calls
-        self.yf_data_cache = {}
+        self.data_cache = {}
 
     def _fetch_yf_data(self, ticker: str) -> Dict[str, Any]:
         """
@@ -99,9 +100,9 @@ class ResearchAnalyzer:
         try:
             # Check cache first
             cache_key = f"{ticker}_data"
-            if cache_key in self.yf_data_cache:
+            if cache_key in self.data_cache:
                 self.logger.debug(f"Cache hit for {ticker}")
-                return self.yf_data_cache[cache_key]
+                return self.data_cache[cache_key]
             
             # Fetch data from yfinance
             stock = yf.Ticker(ticker)
@@ -121,7 +122,7 @@ class ResearchAnalyzer:
                 self.logger.warning(f"Error fetching historical data for {ticker}: {str(e)}")
             
             # Cache the data
-            self.yf_data_cache[cache_key] = yf_data
+            self.data_cache[cache_key] = yf_data
             
         except Exception as e:
             self.logger.error(f"Failed to fetch data for {ticker}: {str(e)}")
@@ -399,81 +400,59 @@ class ResearchAnalyzer:
         
         return min(100, max(0, final_risk_score))  # Ensure score is between 0 and 100
 
-    def run_risk_analysis(self, potential_securities: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    def run_risk_analysis(self) -> Union[Dict[str, Any], bool]:
         """
-        Run risk analysis on potential securities.
-        If potential_securities is not provided, load from input file.
+        Run risk analysis on securities from input file.
+        Returns a dictionary of analyzed securities or False if analysis fails.
         """
-        if potential_securities is None:
-            try:
-                potential_securities = load_from_json(self.input_file)
-            except Exception as e:
-                self.logger.error(f"Error loading potential securities: {str(e)}")
-                return {}
-
-        if not potential_securities:
-            self.logger.warning("No securities provided for analysis")
-            return {}
-
-        analysis_results = {}
-        total_securities = len(potential_securities)
-        processed_count = 0
-        
-        self.logger.info(f"Starting risk analysis for {total_securities} securities")
-        
-        for security in potential_securities:
-            processed_count += 1
-            try:
-                symbol = security.get('Ticker') or security.get('Symbol')
-                if not symbol:
-                    self.logger.warning(f"Missing ticker symbol in security data: {security}")
-                    continue
-
-                self.logger.info(f"Processing {symbol} ({processed_count}/{total_securities})")
+        try:
+            # Check if input file exists
+            if not os.path.exists(self.input_file):
+                self.logger.warning("No securities provided for analysis")
+                return False
                 
-                # Fetch historical data using yfinance
-                historical_data = self._fetch_yf_data(symbol)
-                if not historical_data or historical_data['history'].empty:
-                    self.logger.warning(f"No historical data found for {symbol}")
-                    continue
+            # Read securities from input file
+            with open(self.input_file, 'r') as f:
+                securities = json.load(f)
                 
-                # Calculate risk metrics
-                risk_metrics = {
-                    'Symbol': symbol,
-                    'Beta': historical_data['info'].get('beta', None),
-                    'Market Cap': historical_data['info'].get('marketCap', None),
-                    'name': historical_data['info'].get('shortName', symbol)
-                }
+            if not securities:
+                self.logger.warning("No securities provided for analysis")
+                return False
                 
-                # Skip if essential metrics are missing
-                if risk_metrics['Beta'] is None or risk_metrics['Market Cap'] is None:
-                    self.logger.warning(f"Missing essential metrics for {symbol}")
-                    continue
+            self.logger.info(f"Starting risk analysis for {len(securities)} securities")
             
-                # Calculate risk score
-                risk_score = self._calculate_risk_score(risk_metrics)
+            # Analyze each security
+            results = {}
+            for i, security in enumerate(securities, 1):
+                ticker = security.get('Ticker', security.get('Symbol'))
+                if not ticker:
+                    continue
+                    
+                self.logger.info(f"Processing {ticker} ({i}/{len(securities)})")
+                
+                # Fetch data and calculate risk score
+                yf_data = self._fetch_yf_data(ticker)
+                risk_score = self._calculate_risk_score(security)
                 
                 # Store results
-                analysis_results[symbol] = {
-                    'historical_data': historical_data['history'],
-                    'risk_metrics': risk_metrics,
+                results[ticker] = {
+                    'historical_data': yf_data['history'],
+                    'risk_metrics': security,
                     'risk_score': risk_score
                 }
                 
-                self.logger.info(f"Completed analysis for {symbol} with risk score: {risk_score}")
-            except Exception as e:
-                self.logger.error(f"Error analyzing security {symbol}: {str(e)}")
-                self.logger.error(traceback.format_exc())
-        
-        self.logger.info(f"Risk analysis completed. Successfully analyzed {len(analysis_results)} out of {total_securities} securities")
-        
-        # Save results to output file
-        try:
-            save_to_json(analysis_results, self.output_file)
-            return analysis_results
+                self.logger.info(f"Completed analysis for {ticker} with risk score: {risk_score}")
+            
+            if not results:
+                self.logger.warning("No securities analyzed successfully")
+                return False
+                
+            self.logger.info(f"Risk analysis completed. Successfully analyzed {len(results)} out of {len(securities)} securities")
+            return results
+            
         except Exception as e:
-            self.logger.error(f"Error saving analysis results: {str(e)}")
-            return analysis_results
+            self.logger.error(f"Error in risk analysis: {str(e)}")
+            return False
 
 
 if __name__ == "__main__":

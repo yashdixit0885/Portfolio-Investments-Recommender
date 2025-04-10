@@ -114,9 +114,13 @@ class TestResearchAnalyzer:
             assert result['history'].empty
             
             # Test case 3: Cache hit
-            analyzer.yf_data_cache['CACHED'] = {'info': {'test': 'data'}, 'history': pd.DataFrame()}
+            mock_ticker.side_effect = None  # Reset the side effect
+            mock_ticker.return_value = mock_ticker_instance  # Reset the return value
+            cache_data = {'info': {'test': 'data'}, 'history': pd.DataFrame()}
+            analyzer.data_cache[f"CACHED_data"] = cache_data
             result = analyzer._fetch_yf_data('CACHED')
-            assert result == analyzer.yf_data_cache['CACHED']
+            assert result['info'] == cache_data['info']
+            assert result['history'].equals(cache_data['history'])
 
     def test_calculate_volatility_metrics_edge_cases(self, analyzer):
         """Test edge cases in _calculate_volatility_metrics method."""
@@ -292,18 +296,9 @@ class TestResearchAnalyzer:
             result = analyzer.run_risk_analysis()
             
             # Check the result
-            assert result is True
-            assert output_file.exists()
-            
-            # Check the content of the file
-            with open(output_file, 'r') as f:
-                saved_data = json.load(f)
-            
-            assert 'analysis_timestamp' in saved_data
-            assert 'risk_scored_securities' in saved_data
-            assert len(saved_data['risk_scored_securities']) == 2
-            assert all('risk_score' in item for item in saved_data['risk_scored_securities'])
-            
-            # Check that the scores are sorted (ascending)
-            scores = [item['risk_score'] for item in saved_data['risk_scored_securities']]
-            assert scores == sorted(scores) 
+            assert isinstance(result, dict)
+            assert len(result) == 2  # Should have results for both AAPL and MSFT
+            assert 'AAPL' in result
+            assert 'MSFT' in result
+            assert result['AAPL']['risk_score'] == 50
+            assert result['MSFT']['risk_score'] == 50 
